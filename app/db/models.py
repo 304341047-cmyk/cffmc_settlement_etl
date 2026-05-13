@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, DateTime, Numeric, UniqueConstraint
+from sqlalchemy import Boolean, Column, Integer, String, Date, DateTime, Numeric, UniqueConstraint
 from datetime import datetime
 from app.db.base import Base
 
@@ -6,7 +6,7 @@ from app.db.base import Base
 class TradeExecutionDB(Base):
     __tablename__ = "trade_executions"
     __table_args__ = (
-        UniqueConstraint("account_id", "trade_date", "trade_no", name="uix_trade"),
+        UniqueConstraint("source_file", "sheet_name", "raw_line_no", "row_hash", name="uix_trade_source_row"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -25,6 +25,80 @@ class TradeExecutionDB(Base):
     trade_time = Column(DateTime, nullable=True)
     trade_no = Column(String, nullable=True)
     source_file = Column(String, nullable=True)
+    sheet_name = Column(String, nullable=True)
+    raw_line_no = Column(Integer, nullable=True)
+    row_hash = Column(String, nullable=True)
+
+
+class CashFlowDB(Base):
+    __tablename__ = "cash_flows"
+    __table_args__ = (
+        UniqueConstraint("source_file", "source_section", "raw_line_no", "row_hash", name="uix_cash_flow_source_row"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False)
+    account_id = Column(String, nullable=True)
+    flow_type = Column(String, nullable=False)
+    amount = Column(Numeric(18, 4), nullable=False)
+    currency = Column(String, nullable=True)
+    summary = Column(String, nullable=True)
+    source_file = Column(String, nullable=True)
+    source_section = Column(String, nullable=True)
+    raw_line_no = Column(Integer, nullable=True)
+    row_hash = Column(String, nullable=True)
+
+
+class TradeSummaryDB(Base):
+    __tablename__ = "trade_summaries"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_file",
+            "source_section",
+            "raw_line_no",
+            "row_hash",
+            name="uix_trade_summary_source_row",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False)
+    account_id = Column(String, nullable=True)
+    instrument_code = Column(String, nullable=False)
+    instrument_name = Column(String, nullable=True)
+    asset_type = Column(String, nullable=True)
+    direction = Column(String, nullable=True)
+    open_close = Column(String, nullable=True)
+    volume = Column(Integer, nullable=False, default=0)
+    turnover = Column(Numeric(18, 4), nullable=True)
+    commission = Column(Numeric(18, 4), nullable=True)
+    source_file = Column(String, nullable=True)
+    source_section = Column(String, nullable=True)
+    raw_line_no = Column(Integer, nullable=True)
+    row_hash = Column(String, nullable=True)
+
+
+class CloseDetailDB(Base):
+    __tablename__ = "close_details"
+    __table_args__ = (
+        UniqueConstraint("source_file", "sheet_name", "raw_line_no", "row_hash", name="uix_close_detail_source_row"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False)
+    account_id = Column(String, nullable=True)
+    instrument_code = Column(String, nullable=False)
+    instrument_name = Column(String, nullable=True)
+    direction = Column(String, nullable=True)
+    volume = Column(Integer, nullable=False)
+    open_price = Column(Numeric(18, 4), nullable=True)
+    close_price = Column(Numeric(18, 4), nullable=True)
+    close_pnl = Column(Numeric(18, 4), nullable=True)
+    commission = Column(Numeric(18, 4), nullable=True)
+    source_file = Column(String, nullable=True)
+    sheet_name = Column(String, nullable=True)
+    raw_line_no = Column(Integer, nullable=True)
+    row_hash = Column(String, nullable=True)
 
 
 class PositionDetailDB(Base):
@@ -138,6 +212,79 @@ class SourceFileDB(Base):
     parser_name = Column(String, nullable=True)
     status = Column(String, nullable=False)   # success / failed
     error_message = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class FifoMatchDB(Base):
+    __tablename__ = "fifo_matches"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_file",
+            "open_trade_row_hash",
+            "close_trade_row_hash",
+            "volume",
+            name="uix_fifo_match",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False)
+    account_id = Column(String, nullable=True)
+    instrument_code = Column(String, nullable=False)
+    asset_type = Column(String, nullable=True)
+    direction = Column(String, nullable=False)
+    open_trade_row_hash = Column(String, nullable=True)
+    close_trade_row_hash = Column(String, nullable=True)
+    volume = Column(Integer, nullable=False)
+    open_price = Column(Numeric(18, 4), nullable=True)
+    close_price = Column(Numeric(18, 4), nullable=True)
+    realized_pnl = Column(Numeric(18, 4), nullable=True)
+    source_file = Column(String, nullable=True)
+
+
+class PositionLotDB(Base):
+    __tablename__ = "position_lots"
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_date",
+            "account_id",
+            "instrument_code",
+            "direction",
+            "source_file",
+            "open_trade_row_hash",
+            name="uix_position_lot",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False)
+    account_id = Column(String, nullable=True)
+    instrument_code = Column(String, nullable=False)
+    asset_type = Column(String, nullable=True)
+    direction = Column(String, nullable=False)
+    volume = Column(Integer, nullable=False)
+    remaining_volume = Column(Integer, nullable=False)
+    open_price = Column(Numeric(18, 4), nullable=True)
+    open_time = Column(DateTime, nullable=True)
+    source_file = Column(String, nullable=True)
+    source_type = Column(String, nullable=False, default="trade")
+    source_reason = Column(String, nullable=True)
+    open_trade_row_hash = Column(String, nullable=True)
+
+
+class ValidationIssueDB(Base):
+    __tablename__ = "validation_issues"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=True)
+    account_id = Column(String, nullable=True)
+    source_file = Column(String, nullable=True)
+    check_name = Column(String, nullable=False)
+    severity = Column(String, nullable=False, default="error")
+    message = Column(String, nullable=False)
+    expected_value = Column(String, nullable=True)
+    actual_value = Column(String, nullable=True)
+    is_blocking = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 class OptionExerciseDetailDB(Base):

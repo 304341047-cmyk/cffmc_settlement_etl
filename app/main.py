@@ -6,6 +6,7 @@ from app.parsers.registry import ParserRegistry
 from app.db.base import engine
 from app.db.models import Base
 from app.db_writer import (
+    create_chinese_query_views,
     save_to_db,
     save_source_file_record,
     is_file_already_processed,
@@ -18,6 +19,7 @@ def main():
 
     ensure_directories()
     Base.metadata.create_all(bind=engine)
+    create_chinese_query_views(engine)
 
     logger = setup_logger()
     logger.info("程序启动成功")

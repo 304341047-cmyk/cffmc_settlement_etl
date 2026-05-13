@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
+import hashlib
 import re
 import warnings
 
@@ -10,11 +11,13 @@ import pandas as pd
 from app.parsers.base import BaseParser
 from app.models import (
     TradeExecution,
+    CashFlow,
     PositionSnapshot,
     PositionDetail,
     AccountDailySnapshot,
     OptionExerciseDetail,
 )
+from app.services.fifo import generate_fifo
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
@@ -59,11 +62,17 @@ class CFFMCSettlementParser(BaseParser):
         futures_trades = self.parse_futures_trades(file_path, account_id=account_id)
         option_trades = self.parse_option_trades(file_path, account_id=account_id)
         trades = futures_trades + option_trades
+        cash_flows = self.parse_cash_flows_from_daily_sheet(file_path, account_id=account_id)
 
         futures_position_details = self.parse_futures_position_details(file_path, account_id=account_id)
         option_position_details = self.parse_option_position_details_from_daily_sheet(file_path, account_id=account_id)
         position_details = futures_position_details + option_position_details
         positions = self.aggregate_position_details(position_details)
+        fifo_matches, position_lots, validation_issues = generate_fifo(
+            trades=trades,
+            positions=positions,
+            source_file=file_path.name,
+        )
 
         exercise_details = self.parse_option_exercise_details_from_daily_sheet(
             file_path,
@@ -71,9 +80,13 @@ class CFFMCSettlementParser(BaseParser):
         )
 
         result["trades"] = trades
+        result["cash_flows"] = cash_flows
         result["position_details"] = position_details
         result["positions"] = positions
         result["exercise_details"] = exercise_details
+        result["fifo_matches"] = fifo_matches
+        result["position_lots"] = position_lots
+        result["validation_issues"] = validation_issues
         result["accounts"] = accounts
         result["validation"] = self.validate_result(trades, accounts)
 
@@ -101,11 +114,14 @@ class CFFMCSettlementParser(BaseParser):
         df = self.clean_dataframe_columns(df)
 
         trades: list[TradeExecution] = []
-        for _, row in df.iterrows():
+        for idx, row in df.iterrows():
+            raw_line_no = int(idx) + header_row_index + 2
             trade = self.build_futures_trade_from_row(
                 row=row,
                 source_file=file_path.name,
                 account_id=account_id,
+                sheet_name="成交明细",
+                raw_line_no=raw_line_no,
             )
             if trade:
                 trades.append(trade)
@@ -126,6 +142,8 @@ class CFFMCSettlementParser(BaseParser):
         row: pd.Series,
         source_file: str,
         account_id: str | None = None,
+        sheet_name: str | None = None,
+        raw_line_no: int | None = None,
     ) -> Optional[TradeExecution]:
         instrument_code = self.get_str_value(row, "合约")
         if not instrument_code or self.is_summary_or_invalid_text(instrument_code):
@@ -152,6 +170,9 @@ class CFFMCSettlementParser(BaseParser):
             trade_time=self.get_datetime_value(row, "成交时间", trade_date),
             trade_no=self.get_trade_no_value(row, "成交序号"),
             source_file=source_file,
+            sheet_name=sheet_name,
+            raw_line_no=raw_line_no,
+            row_hash=self.build_row_hash(source_file, sheet_name, raw_line_no, row),
         )
 
     # =========================
@@ -180,11 +201,14 @@ class CFFMCSettlementParser(BaseParser):
         df = self.clean_dataframe_columns(df)
 
         trades: list[TradeExecution] = []
-        for _, row in df.iterrows():
+        for idx, row in df.iterrows():
+            raw_line_no = int(idx) + header_row_index + 2
             trade = self.build_option_trade_from_row(
                 row=row,
                 source_file=file_path.name,
                 account_id=account_id,
+                sheet_name="期权成交明细",
+                raw_line_no=raw_line_no,
             )
             if trade:
                 trades.append(trade)
@@ -205,6 +229,8 @@ class CFFMCSettlementParser(BaseParser):
         row: pd.Series,
         source_file: str,
         account_id: str | None = None,
+        sheet_name: str | None = None,
+        raw_line_no: int | None = None,
     ) -> Optional[TradeExecution]:
         instrument_code = self.get_str_value(row, "品种合约")
         if not instrument_code or self.is_summary_or_invalid_text(instrument_code):
@@ -233,7 +259,95 @@ class CFFMCSettlementParser(BaseParser):
             trade_time=self.get_datetime_value(row, "成交时间", trade_date),
             trade_no=trade_no,
             source_file=source_file,
+            sheet_name=sheet_name,
+            raw_line_no=raw_line_no,
+            row_hash=self.build_row_hash(source_file, sheet_name, raw_line_no, row),
         )
+
+    # =========================
+    # 出入金流水
+    # =========================
+    def parse_cash_flows_from_daily_sheet(
+        self,
+        file_path: Path,
+        account_id: str | None = None,
+    ) -> list[CashFlow]:
+        sheet_name = "客户交易结算日报"
+        df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+
+        title_row_index = self.find_section_title_row(df_raw, "期货期权账户出入金明细")
+        if title_row_index is None:
+            return []
+
+        header_row_index = title_row_index + 1
+        if header_row_index >= len(df_raw):
+            return []
+
+        header = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[header_row_index].tolist()]
+        if "发生日期" not in header or ("入金" not in header and "出金" not in header):
+            return []
+
+        rows = []
+        for idx in range(header_row_index + 1, len(df_raw)):
+            raw_row = df_raw.iloc[idx]
+            row_values = [str(v).strip() if not pd.isna(v) else "" for v in raw_row.tolist()]
+            joined = "".join(row_values).replace(" ", "")
+
+            if not any(row_values):
+                break
+            if any(keyword in joined for keyword in ["其它资金明细", "期货成交汇总", "期权成交汇总"]):
+                break
+
+            rows.append((idx, raw_row))
+
+        trade_date = self.parse_trade_date_from_filename(file_path.name)
+        flows: list[CashFlow] = []
+
+        for idx, raw_row in rows:
+            row = pd.Series(raw_row.values, index=header)
+            date_text = self.get_str_value(row, "发生日期")
+            if not date_text or date_text == "合计":
+                continue
+
+            deposit_amount = self.get_decimal_value(row, "入金")
+            withdrawal_amount = self.get_decimal_value(row, "出金")
+            summary = self.get_str_value(row, "摘要")
+
+            if deposit_amount and deposit_amount != 0:
+                raw_line_no = idx + 1
+                flows.append(
+                    CashFlow(
+                        trade_date=trade_date,
+                        account_id=account_id,
+                        flow_type="deposit",
+                        amount=abs(deposit_amount),
+                        currency="CNY",
+                        summary=summary,
+                        source_file=file_path.name,
+                        source_section="期货期权账户出入金明细",
+                        raw_line_no=raw_line_no,
+                        row_hash=self.build_row_hash(file_path.name, "期货期权账户出入金明细", raw_line_no, row),
+                    )
+                )
+
+            if withdrawal_amount and withdrawal_amount != 0:
+                raw_line_no = idx + 1
+                flows.append(
+                    CashFlow(
+                        trade_date=trade_date,
+                        account_id=account_id,
+                        flow_type="withdrawal",
+                        amount=abs(withdrawal_amount),
+                        currency="CNY",
+                        summary=summary,
+                        source_file=file_path.name,
+                        source_section="期货期权账户出入金明细",
+                        raw_line_no=raw_line_no,
+                        row_hash=self.build_row_hash(file_path.name, "期货期权账户出入金明细", raw_line_no, row),
+                    )
+                )
+
+        return flows
 
     # =========================
     # 持仓明细：期货
@@ -1524,6 +1638,31 @@ class CFFMCSettlementParser(BaseParser):
         ]
 
         return any(keyword in text for keyword in invalid_keywords)
+
+    def find_section_title_row(self, df_raw: pd.DataFrame, title_keyword: str) -> Optional[int]:
+        for i in range(len(df_raw)):
+            row_values = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[i].tolist()]
+            joined = "".join(row_values).replace(" ", "")
+            if title_keyword in joined:
+                return i
+        return None
+
+    def build_row_hash(
+        self,
+        source_file: str,
+        sheet_name: str | None,
+        raw_line_no: int | None,
+        row: pd.Series,
+    ) -> str:
+        parts = [source_file or "", sheet_name or "", str(raw_line_no or "")]
+        for column_name, value in row.items():
+            if pd.isna(value):
+                value_text = ""
+            else:
+                value_text = str(value).strip()
+            parts.append(f"{column_name}={value_text}")
+
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
     def normalize_text(self, s: str) -> str:
         return (

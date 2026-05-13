@@ -23,3 +23,6 @@ class TradeExecution(BaseModel):
     trade_no: Optional[str] = Field(None, description="成交编号")
 
     source_file: Optional[str] = Field(None, description="来源文件名")
+    sheet_name: Optional[str] = None
+    raw_line_no: Optional[int] = None
+    row_hash: Optional[str] = None
