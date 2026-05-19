@@ -1,23 +1,27 @@
-from pathlib import Path
-from datetime import datetime
+from __future__ import annotations
+
+from collections import defaultdict
 from decimal import Decimal
-from typing import Optional
+from pathlib import Path
+from typing import Any
 import hashlib
+import json
 import re
 import warnings
 
 import pandas as pd
 
-from app.parsers.base import BaseParser
 from app.models import (
-    TradeExecution,
-    CashFlow,
-    PositionSnapshot,
-    PositionDetail,
-    AccountDailySnapshot,
-    OptionExerciseDetail,
+    AccountSummary,
+    DepositWithdrawal,
+    ExerciseStatement,
+    PositionClosed,
+    Positions,
+    PositionsDetail,
+    TransactionRecord,
+    ValidationResult,
 )
-from app.services.fifo import generate_fifo
+from app.parsers.base import BaseParser
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
@@ -25,1650 +29,779 @@ warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 class CFFMCSettlementParser(BaseParser):
     name = "CFFMCSettlementParser"
 
-    REQUIRED_SHEETS = [
-        "客户交易结算日报",
-        "成交明细",
-        "持仓明细",
-    ]
+    REQUIRED_SHEETS = ["客户交易结算日报", "成交明细", "持仓明细"]
 
-    # =========================
-    # 入口
-    # =========================
     def can_parse(self, file_path: Path) -> bool:
-        if file_path.suffix.lower() not in [".xlsx", ".xls"]:
+        if file_path.suffix.lower() not in {".xlsx", ".xls"}:
             return False
-
         try:
             excel = pd.ExcelFile(file_path)
             return any(sheet in excel.sheet_names for sheet in self.REQUIRED_SHEETS)
         except Exception:
             return False
 
-    def parse(self, file_path: Path):
-        """
-        统一解析入口：
-        1. 账户日报
-        2. 成交（期货 + 期权）
-        3. 持仓明细（期货 + 期权）
-        4. 持仓快照（由明细聚合）
-        5. 行权明细
-        6. 手续费校验
-        """
+    def parse(self, file_path: Path) -> dict[str, Any]:
         result = self.parse_result_template()
 
-        accounts = self.parse_accounts(file_path)
-        account_id = accounts[0].account_id if accounts else None
+        account_rows = self.parse_account_summary(file_path)
+        account_id = account_rows[0].account_id if account_rows else None
+        trade_date = self.trade_date_from_file(file_path.name)
 
-        futures_trades = self.parse_futures_trades(file_path, account_id=account_id)
-        option_trades = self.parse_option_trades(file_path, account_id=account_id)
-        trades = futures_trades + option_trades
-        cash_flows = self.parse_cash_flows_from_daily_sheet(file_path, account_id=account_id)
+        transaction_rows = []
+        transaction_rows.extend(self.parse_futures_transactions(file_path, account_id))
+        transaction_rows.extend(self.parse_option_transactions(file_path, account_id))
 
-        futures_position_details = self.parse_futures_position_details(file_path, account_id=account_id)
-        option_position_details = self.parse_option_position_details_from_daily_sheet(file_path, account_id=account_id)
-        position_details = futures_position_details + option_position_details
-        positions = self.aggregate_position_details(position_details)
-        fifo_matches, position_lots, validation_issues = generate_fifo(
-            trades=trades,
-            positions=positions,
-            source_file=file_path.name,
-        )
+        position_detail_rows = []
+        position_detail_rows.extend(self.parse_futures_positions_detail(file_path, account_id))
+        position_detail_rows.extend(self.parse_option_positions_detail(file_path, account_id))
 
-        exercise_details = self.parse_option_exercise_details_from_daily_sheet(
-            file_path,
-            account_id=account_id,
-        )
-
-        result["trades"] = trades
-        result["cash_flows"] = cash_flows
-        result["position_details"] = position_details
-        result["positions"] = positions
-        result["exercise_details"] = exercise_details
-        result["fifo_matches"] = fifo_matches
-        result["position_lots"] = position_lots
-        result["validation_issues"] = validation_issues
-        result["accounts"] = accounts
-        result["validation"] = self.validate_result(trades, accounts)
-
+        result["account_summary"] = account_rows
+        result["deposit_withdrawal"] = self.parse_deposit_withdrawal(file_path, account_id)
+        result["transaction_record"] = transaction_rows
+        result["exercise_statement"] = self.parse_exercise_statement(file_path, account_id)
+        result["position_closed"] = self.parse_position_closed(file_path, account_id)
+        result["positions_detail"] = position_detail_rows
+        result["positions"] = self.aggregate_positions(position_detail_rows, trade_date, file_path.name)
+        result["validation_result"] = self.validate_commission(result, trade_date, account_id, file_path.name)
         return result
 
-    # =========================
-    # 成交：期货
-    # =========================
-    def parse_futures_trades(
-        self,
-        file_path: Path,
-        account_id: str | None = None,
-    ) -> list[TradeExecution]:
-        df_raw = pd.read_excel(file_path, sheet_name="成交明细", header=None)
-        header_row_index = self.find_trade_header_row(df_raw)
-        if header_row_index is None:
-            return []
-
-        df = pd.read_excel(
-            file_path,
-            sheet_name="成交明细",
-            header=header_row_index,
-            dtype={"成交序号": str},
-        )
-        df = self.clean_dataframe_columns(df)
-
-        trades: list[TradeExecution] = []
-        for idx, row in df.iterrows():
-            raw_line_no = int(idx) + header_row_index + 2
-            trade = self.build_futures_trade_from_row(
-                row=row,
-                source_file=file_path.name,
-                account_id=account_id,
-                sheet_name="成交明细",
-                raw_line_no=raw_line_no,
-            )
-            if trade:
-                trades.append(trade)
-
-        return trades
-
-    def find_trade_header_row(self, df_raw: pd.DataFrame) -> Optional[int]:
-        keywords = ["合约", "买/卖", "成交价", "手数"]
-
-        for i in range(len(df_raw)):
-            row_values = [str(v).strip() for v in df_raw.iloc[i].tolist()]
-            if sum(1 for k in keywords if k in row_values) >= 3:
-                return i
-        return None
-
-    def build_futures_trade_from_row(
-        self,
-        row: pd.Series,
-        source_file: str,
-        account_id: str | None = None,
-        sheet_name: str | None = None,
-        raw_line_no: int | None = None,
-    ) -> Optional[TradeExecution]:
-        instrument_code = self.get_str_value(row, "合约")
-        if not instrument_code or self.is_summary_or_invalid_text(instrument_code):
-            return None
-
-        trade_date = self.parse_trade_date_from_filename(source_file)
-
-        volume = self.get_int_value(row, "手数")
-        price = self.get_decimal_value(row, "成交价")
-        if volume is None or price is None:
-            return None
-
-        return TradeExecution(
-            trade_date=trade_date,
-            account_id=account_id,
-            instrument_code=instrument_code,
-            asset_type="futures",
-            direction=self.map_direction(self.get_str_value(row, "买/卖")) or "unknown",
-            open_close=self.map_open_close(self.get_str_value(row, "开/平")),
-            volume=volume,
-            price=price,
-            turnover=self.get_decimal_value(row, "成交额"),
-            commission=self.get_decimal_value(row, "手续费"),
-            trade_time=self.get_datetime_value(row, "成交时间", trade_date),
-            trade_no=self.get_trade_no_value(row, "成交序号"),
-            source_file=source_file,
-            sheet_name=sheet_name,
-            raw_line_no=raw_line_no,
-            row_hash=self.build_row_hash(source_file, sheet_name, raw_line_no, row),
-        )
-
-    # =========================
-    # 成交：期权
-    # =========================
-    def parse_option_trades(
-        self,
-        file_path: Path,
-        account_id: str | None = None,
-    ) -> list[TradeExecution]:
-        try:
-            df_raw = pd.read_excel(file_path, sheet_name="期权成交明细", header=None)
-        except Exception:
-            return []
-
-        header_row_index = self.find_option_trade_header_row(df_raw)
-        if header_row_index is None:
-            return []
-
-        df = pd.read_excel(
-            file_path,
-            sheet_name="期权成交明细",
-            header=header_row_index,
-            dtype={"流水号": str},
-        )
-        df = self.clean_dataframe_columns(df)
-
-        trades: list[TradeExecution] = []
-        for idx, row in df.iterrows():
-            raw_line_no = int(idx) + header_row_index + 2
-            trade = self.build_option_trade_from_row(
-                row=row,
-                source_file=file_path.name,
-                account_id=account_id,
-                sheet_name="期权成交明细",
-                raw_line_no=raw_line_no,
-            )
-            if trade:
-                trades.append(trade)
-
-        return trades
-
-    def find_option_trade_header_row(self, df_raw: pd.DataFrame) -> Optional[int]:
-        keywords = ["品种合约", "流水号", "成交时间", "买/卖", "权利金单价", "成交量", "手续费"]
-
-        for i in range(len(df_raw)):
-            row_values = [str(v).strip() for v in df_raw.iloc[i].tolist()]
-            if sum(1 for k in keywords if k in row_values) >= 5:
-                return i
-        return None
-
-    def build_option_trade_from_row(
-        self,
-        row: pd.Series,
-        source_file: str,
-        account_id: str | None = None,
-        sheet_name: str | None = None,
-        raw_line_no: int | None = None,
-    ) -> Optional[TradeExecution]:
-        instrument_code = self.get_str_value(row, "品种合约")
-        if not instrument_code or self.is_summary_or_invalid_text(instrument_code):
-            return None
-
-        trade_date = self.parse_trade_date_from_filename(source_file)
-        volume = self.get_int_value(row, "成交量")
-        price = self.get_decimal_value(row, "权利金单价")
-        if volume is None or price is None:
-            return None
-
-        trade_no_raw = self.get_trade_no_value(row, "流水号")
-        trade_no = f"OPT_{trade_no_raw}" if trade_no_raw else None
-
-        return TradeExecution(
-            trade_date=trade_date,
-            account_id=account_id,
-            instrument_code=instrument_code,
-            asset_type="option",
-            direction=self.map_direction(self.get_str_value(row, "买/卖")) or "unknown",
-            open_close=None,
-            volume=volume,
-            price=price,
-            turnover=self.get_decimal_value(row, "权利金"),
-            commission=self.get_decimal_value(row, "手续费"),
-            trade_time=self.get_datetime_value(row, "成交时间", trade_date),
-            trade_no=trade_no,
-            source_file=source_file,
-            sheet_name=sheet_name,
-            raw_line_no=raw_line_no,
-            row_hash=self.build_row_hash(source_file, sheet_name, raw_line_no, row),
-        )
-
-    # =========================
-    # 出入金流水
-    # =========================
-    def parse_cash_flows_from_daily_sheet(
-        self,
-        file_path: Path,
-        account_id: str | None = None,
-    ) -> list[CashFlow]:
+    # ------------------------------------------------------------------
+    # Account and cash sections
+    # ------------------------------------------------------------------
+    def parse_account_summary(self, file_path: Path) -> list[AccountSummary]:
         sheet_name = "客户交易结算日报"
-        df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+        df = self.read_sheet(file_path, sheet_name)
+        data_map = self.extract_key_values(df)
+        other_fund_map = self.extract_other_fund_details(df)
+        trade_date = self.trade_date_from_file(file_path.name)
 
-        title_row_index = self.find_section_title_row(df_raw, "期货期权账户出入金明细")
-        if title_row_index is None:
-            return []
+        total_premium = self.decimal_from_map(data_map, "当日总权利金")
+        premium_received, premium_paid = self.split_signed_amount(total_premium)
+        balance_c_f = self.decimal_from_map(data_map, "当日结存")
+        client_equity = self.decimal_from_map(data_map, "客户权益") or balance_c_f
 
-        header_row_index = title_row_index + 1
-        if header_row_index >= len(df_raw):
-            return []
+        account = AccountSummary(
+            creation_date=trade_date,
+            date_from=trade_date,
+            date_to=trade_date,
+            client_id=None,
+            client_name=self.str_from_map(data_map, "客户名称"),
+            account_id=self.str_from_map(data_map, "客户期货期权内部资金账户"),
+            currency="CNY",
+            balance_b_f=self.decimal_from_map(data_map, "上日结存"),
+            deposit_withdrawal=self.decimal_from_map(data_map, "当日存取合计"),
+            realized_p_l=self.decimal_from_map(data_map, "当日盈亏"),
+            mtm_p_l=self.decimal_from_map(data_map, "持仓盯市盈亏"),
+            exercise_p_l=self.decimal_from_map(data_map, "行权盈亏"),
+            commission=self.decimal_from_map(data_map, "当日手续费"),
+            exercise_fee=abs(other_fund_map.get("行权手续费", Decimal("0"))),
+            delivery_fee=other_fund_map.get("交割手续费"),
+            premium_received=premium_received,
+            premium_paid=premium_paid,
+            balance_c_f=balance_c_f,
+            client_equity=client_equity,
+            pledge_amount=self.decimal_from_map(data_map, "非货币充抵金额"),
+            fx_pledge_occ=self.decimal_from_map(data_map, "货币充抵金额"),
+            margin_occupied=self.decimal_from_map(data_map, "保证金占用"),
+            fund_avail=self.decimal_from_map(data_map, "可用资金"),
+            risk_degree=self.percent_from_map(data_map, "风险度"),
+            margin_call=self.decimal_from_map(data_map, "追加保证金"),
+            source_file=file_path.name,
+            raw_payload=self.json_payload(data_map),
+        )
+        return [account]
 
-        header = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[header_row_index].tolist()]
-        if "发生日期" not in header or ("入金" not in header and "出金" not in header):
-            return []
-
-        rows = []
-        for idx in range(header_row_index + 1, len(df_raw)):
-            raw_row = df_raw.iloc[idx]
-            row_values = [str(v).strip() if not pd.isna(v) else "" for v in raw_row.tolist()]
-            joined = "".join(row_values).replace(" ", "")
-
-            if not any(row_values):
-                break
-            if any(keyword in joined for keyword in ["其它资金明细", "期货成交汇总", "期权成交汇总"]):
-                break
-
-            rows.append((idx, raw_row))
-
-        trade_date = self.parse_trade_date_from_filename(file_path.name)
-        flows: list[CashFlow] = []
-
-        for idx, raw_row in rows:
-            row = pd.Series(raw_row.values, index=header)
-            date_text = self.get_str_value(row, "发生日期")
-            if not date_text or date_text == "合计":
-                continue
-
-            deposit_amount = self.get_decimal_value(row, "入金")
-            withdrawal_amount = self.get_decimal_value(row, "出金")
-            summary = self.get_str_value(row, "摘要")
-
-            if deposit_amount and deposit_amount != 0:
-                raw_line_no = idx + 1
-                flows.append(
-                    CashFlow(
-                        trade_date=trade_date,
-                        account_id=account_id,
-                        flow_type="deposit",
-                        amount=abs(deposit_amount),
-                        currency="CNY",
-                        summary=summary,
-                        source_file=file_path.name,
-                        source_section="期货期权账户出入金明细",
-                        raw_line_no=raw_line_no,
-                        row_hash=self.build_row_hash(file_path.name, "期货期权账户出入金明细", raw_line_no, row),
-                    )
-                )
-
-            if withdrawal_amount and withdrawal_amount != 0:
-                raw_line_no = idx + 1
-                flows.append(
-                    CashFlow(
-                        trade_date=trade_date,
-                        account_id=account_id,
-                        flow_type="withdrawal",
-                        amount=abs(withdrawal_amount),
-                        currency="CNY",
-                        summary=summary,
-                        source_file=file_path.name,
-                        source_section="期货期权账户出入金明细",
-                        raw_line_no=raw_line_no,
-                        row_hash=self.build_row_hash(file_path.name, "期货期权账户出入金明细", raw_line_no, row),
-                    )
-                )
-
-        return flows
-
-    # =========================
-    # 持仓明细：期货
-    # =========================
-    def parse_futures_position_details(
+    def parse_deposit_withdrawal(
         self,
         file_path: Path,
-        account_id: str | None = None,
-    ) -> list[PositionDetail]:
-        df_raw = pd.read_excel(file_path, sheet_name="持仓明细", header=None)
-        header_row_index = self.find_position_header_row(df_raw)
-        if header_row_index is None:
+        account_id: str | None,
+    ) -> list[DepositWithdrawal]:
+        sheet_name = "客户交易结算日报"
+        df = self.read_sheet(file_path, sheet_name)
+        title_row = self.find_section_title_row(df, "期货期权账户出入金明细")
+        if title_row is None or title_row + 1 >= len(df):
             return []
 
-        df = pd.read_excel(file_path, sheet_name="持仓明细", header=header_row_index)
-        df = self.clean_dataframe_columns(df)
+        header_row = title_row + 1
+        header = self.row_values(df.iloc[header_row])
+        rows: list[DepositWithdrawal] = []
 
-        details: list[PositionDetail] = []
+        for idx in range(header_row + 1, len(df)):
+            values = self.row_values(df.iloc[idx])
+            joined = "".join(values).replace(" ", "")
+            if not any(values) or "其它资金明细" in joined or "期货持仓汇总" in joined:
+                break
+            if values[0] == "合计":
+                continue
+
+            row = pd.Series(df.iloc[idx].values, index=header)
+            deposit = self.get_decimal(row, "入金")
+            withdrawal = self.get_decimal(row, "出金")
+            if self.is_zero_or_none(deposit) and self.is_zero_or_none(withdrawal):
+                continue
+
+            raw_line_no = idx + 1
+            rows.append(
+                DepositWithdrawal(
+                    date=self.date8(self.get_value(row, "发生日期")) or self.trade_date_from_file(file_path.name),
+                    type=self.get_text(row, "方式"),
+                    deposit=deposit,
+                    withdrawal=withdrawal,
+                    exchange_rate=None,
+                    account_id=account_id,
+                    note=self.get_text(row, "摘要"),
+                    source_file=file_path.name,
+                    source_section="期货期权账户出入金明细",
+                    raw_line_no=raw_line_no,
+                    row_hash=self.row_hash(file_path.name, sheet_name, raw_line_no, row),
+                    raw_payload=self.json_payload(row.to_dict()),
+                )
+            )
+        return rows
+
+    # ------------------------------------------------------------------
+    # Transactions
+    # ------------------------------------------------------------------
+    def parse_futures_transactions(
+        self,
+        file_path: Path,
+        account_id: str | None,
+    ) -> list[TransactionRecord]:
+        sheet_name = "成交明细"
+        df, header_row = self.read_table(file_path, sheet_name, ["合约", "成交序号", "买/卖", "成交价", "开/平"])
+        if df is None:
+            return []
+
+        rows: list[TransactionRecord] = []
         for idx, row in df.iterrows():
-            detail_list = self.build_futures_position_details_from_row(
-                row=row,
-                source_file=file_path.name,
-                account_id=account_id,
-                raw_line_no=idx + header_row_index + 2,
-            )
-            details.extend(detail_list)
+            instrument = self.get_text(row, "合约")
+            if not instrument or self.is_summary(instrument):
+                continue
+            lots = self.get_decimal(row, "手数")
+            price = self.get_decimal(row, "成交价")
+            if self.is_zero_or_none(lots) or price is None:
+                continue
 
-        return details
-
-    def find_position_header_row(self, df_raw: pd.DataFrame) -> Optional[int]:
-        keywords = ["合约", "买持仓", "卖持仓", "持仓盈亏", "今结算价"]
-
-        for i in range(len(df_raw)):
-            row_values = [str(v).strip() for v in df_raw.iloc[i].tolist()]
-            if sum(1 for k in keywords if k in row_values) >= 3:
-                return i
-        return None
-
-    def build_futures_position_details_from_row(
-        self,
-        row: pd.Series,
-        source_file: str,
-        account_id: str | None = None,
-        raw_line_no: int | None = None,
-    ) -> list[PositionDetail]:
-        results: list[PositionDetail] = []
-
-        instrument_code = self.get_str_value(row, "合约")
-        if not instrument_code or self.is_summary_or_invalid_text(instrument_code):
-            return results
-
-        trade_date = self.parse_trade_date_from_filename(source_file)
-
-        long_qty = self.get_int_value(row, "买持仓")
-        short_qty = self.get_int_value(row, "卖持仓")
-
-        if (not long_qty or long_qty <= 0) and (not short_qty or short_qty <= 0):
-            return results
-
-        long_price = self.get_decimal_value(row, "买入价")
-        short_price = self.get_decimal_value(row, "卖出价")
-        settlement_price = self.get_decimal_value(row, "今结算价")
-        yesterday_settlement_price = self.get_decimal_value(row, "昨结算价")
-        unrealized_pnl = self.get_decimal_value(row, "持仓盈亏")
-
-        if long_qty and long_qty > 0:
-            results.append(
-                PositionDetail(
-                    trade_date=trade_date,
+            raw_line_no = int(idx) + header_row + 2
+            trade_date = self.date8(self.get_value(row, "实际成交日期")) or self.trade_date_from_file(file_path.name)
+            rows.append(
+                TransactionRecord(
+                    date=trade_date,
+                    product=self.product_from_instrument(instrument),
+                    instrument=instrument,
+                    b_s=self.map_buy_sell(self.get_text(row, "买/卖")),
+                    s_h=self.map_hedge(self.get_text(row, "投机（一般）/套保/套利")),
+                    price=price,
+                    lots=lots,
+                    turnover=self.get_decimal(row, "成交额"),
+                    o_c=self.map_open_close(self.get_text(row, "开/平")),
+                    fee=self.get_decimal(row, "手续费"),
+                    realized_p_l=self.get_decimal(row, "平仓盈亏"),
+                    premium_received_paid=None,
+                    trans_no=self.get_text(row, "成交序号"),
                     account_id=account_id,
-                    instrument_code=instrument_code,
-                    asset_type="futures",
-                    direction="long",
-                    open_interest=long_qty,
-                    avg_open_price=long_price,
-                    settlement_price=settlement_price,
-                    yesterday_settlement_price=yesterday_settlement_price,
-                    unrealized_pnl=unrealized_pnl,
-                    source_file=source_file,
-                    source_section="持仓明细",
+                    source_file=file_path.name,
+                    sheet_name=sheet_name,
                     raw_line_no=raw_line_no,
+                    row_hash=self.row_hash(file_path.name, sheet_name, raw_line_no, row),
+                    trade_time=self.get_text(row, "成交时间"),
+                    raw_payload=self.json_payload(row.to_dict()),
                 )
             )
+        return rows
 
-        if short_qty and short_qty > 0:
-            results.append(
-                PositionDetail(
-                    trade_date=trade_date,
-                    account_id=account_id,
-                    instrument_code=instrument_code,
-                    asset_type="futures",
-                    direction="short",
-                    open_interest=short_qty,
-                    avg_open_price=short_price,
-                    settlement_price=settlement_price,
-                    yesterday_settlement_price=yesterday_settlement_price,
-                    unrealized_pnl=unrealized_pnl,
-                    source_file=source_file,
-                    source_section="持仓明细",
-                    raw_line_no=raw_line_no,
-                )
-            )
-
-        return results
-
-    # =========================
-    # 持仓明细：期权（嵌在日报）
-    # =========================
-    def parse_option_position_details_from_daily_sheet(
+    def parse_option_transactions(
         self,
         file_path: Path,
-        account_id: str | None = None,
-    ) -> list[PositionDetail]:
-        df_raw = pd.read_excel(file_path, sheet_name="客户交易结算日报", header=None)
-
-        header_row_index = self.find_option_position_header_row(df_raw)
-        if header_row_index is None:
+        account_id: str | None,
+    ) -> list[TransactionRecord]:
+        sheet_name = "期权成交明细"
+        df, header_row = self.read_table(file_path, sheet_name, ["品种合约", "流水号", "买/卖", "权利金单价", "成交量"])
+        if df is None:
             return []
 
-        section_df = self.extract_option_position_section(df_raw, header_row_index)
-        if section_df.empty:
-            return []
-
-        section_df.columns = [str(v).strip() for v in df_raw.iloc[header_row_index].tolist()]
-        section_df = section_df.dropna(how="all")
-
-        details: list[PositionDetail] = []
-        trade_date = self.parse_trade_date_from_filename(file_path.name)
-
-        for idx, row in section_df.iterrows():
-            detail_list = self.build_option_position_details_from_row(
-                row=row,
-                trade_date=trade_date,
-                source_file=file_path.name,
-                account_id=account_id,
-                raw_line_no=idx + 1,
-            )
-            details.extend(detail_list)
-
-        return details
-
-    def find_option_position_header_row(self, df_raw: pd.DataFrame) -> Optional[int]:
-        found_section = False
-
-        for i in range(len(df_raw)):
-            row_values = [str(v).strip() for v in df_raw.iloc[i].tolist()]
-            normalized = [v.replace(" ", "") for v in row_values]
-
-            if any("期权持仓汇总" in v for v in normalized):
-                found_section = True
+        rows: list[TransactionRecord] = []
+        for idx, row in df.iterrows():
+            instrument = self.get_text(row, "品种合约")
+            if not instrument or self.is_summary(instrument):
+                continue
+            lots = self.get_decimal(row, "成交量")
+            price = self.get_decimal(row, "权利金单价")
+            if self.is_zero_or_none(lots) or price is None:
                 continue
 
-            if not found_section:
-                continue
-
-            required = ["品种合约", "标的合约", "期权类型", "执行价", "买持仓", "卖持仓", "今结算价"]
-            if sum(1 for k in required if k in row_values) >= 5:
-                return i
-
-        return None
-
-    def extract_option_position_section(
-        self,
-        df_raw: pd.DataFrame,
-        header_row_index: int,
-    ) -> pd.DataFrame:
-        """
-        只截取期权持仓区块，不把后面的行权明细等区块吃进来。
-        """
-        stop_keywords = [
-            "行权明细",
-            "履约明细",
-            "交割明细",
-            "期权类型汇总",
-            "期权品种汇总",
-            "品种汇总",
-            "证券成交明细",
-            "资金明细",
-            "交易所",
-        ]
-
-        rows = []
-        empty_streak = 0
-
-        for i in range(header_row_index + 1, len(df_raw)):
-            row = df_raw.iloc[i]
-            row_values = [str(v).strip() if not pd.isna(v) else "" for v in row.tolist()]
-            joined = "".join(row_values).replace(" ", "")
-
-            if not any(row_values):
-                empty_streak += 1
-                if empty_streak >= 2:
-                    break
-                continue
-            else:
-                empty_streak = 0
-
-            if any(keyword in joined for keyword in stop_keywords):
-                break
-
-            rows.append(row)
-
-        if not rows:
-            return pd.DataFrame()
-
-        return pd.DataFrame(rows)
-
-    def build_option_position_details_from_row(
-        self,
-        row: pd.Series,
-        trade_date,
-        source_file: str,
-        account_id: str | None = None,
-        raw_line_no: int | None = None,
-    ) -> list[PositionDetail]:
-        results: list[PositionDetail] = []
-
-        instrument_code = self.get_str_value(row, "品种合约")
-        underlying = self.get_str_value(row, "标的合约")
-        option_type_text = self.get_str_value(row, "期权类型")
-        strike_price = self.get_decimal_value(row, "执行价")
-
-        if not self.is_valid_option_position_row(
-            instrument_code=instrument_code,
-            option_type_text=option_type_text,
-            strike_price=strike_price,
-            row=row,
-        ):
-            return results
-
-        long_qty = self.get_int_value(row, "买持仓")
-        short_qty = self.get_int_value(row, "卖持仓")
-
-        long_price = self.get_decimal_value(row, "买均价")
-        short_price = self.get_decimal_value(row, "卖均价")
-        settlement_price = self.get_decimal_value(row, "今结算价")
-        yesterday_settlement_price = self.get_decimal_value(row, "昨结算价")
-        margin_occupied = self.get_decimal_value(row, "交易保证金")
-
-        if long_qty and long_qty > 0:
-            results.append(
-                PositionDetail(
-                    trade_date=trade_date,
+            raw_line_no = int(idx) + header_row + 2
+            premium = self.get_decimal(row, "权利金")
+            rows.append(
+                TransactionRecord(
+                    date=self.date8(self.get_value(row, "成交日期")) or self.trade_date_from_file(file_path.name),
+                    product=self.product_from_instrument(instrument),
+                    instrument=instrument,
+                    b_s=self.map_buy_sell(self.get_text(row, "买/卖")),
+                    s_h="一般",
+                    price=price,
+                    lots=lots,
+                    turnover=abs(premium) if premium is not None else None,
+                    o_c=None,
+                    fee=self.get_decimal(row, "手续费"),
+                    realized_p_l=None,
+                    premium_received_paid=premium,
+                    trans_no=self.get_text(row, "流水号"),
                     account_id=account_id,
-                    instrument_code=instrument_code,
-                    instrument_name=underlying,
-                    asset_type="option",
-                    direction="long",
-                    open_interest=long_qty,
-                    avg_open_price=long_price,
-                    settlement_price=settlement_price,
-                    yesterday_settlement_price=yesterday_settlement_price,
-                    margin_occupied=Decimal("0"),
-                    source_file=source_file,
-                    source_section="期权持仓汇总",
+                    source_file=file_path.name,
+                    sheet_name=sheet_name,
                     raw_line_no=raw_line_no,
+                    row_hash=self.row_hash(file_path.name, sheet_name, raw_line_no, row),
+                    trade_time=self.get_text(row, "成交时间"),
+                    raw_payload=self.json_payload(row.to_dict()),
                 )
             )
+        return rows
 
-        if short_qty and short_qty > 0:
-            results.append(
-                PositionDetail(
-                    trade_date=trade_date,
-                    account_id=account_id,
-                    instrument_code=instrument_code,
-                    instrument_name=underlying,
-                    asset_type="option",
-                    direction="short",
-                    open_interest=short_qty,
-                    avg_open_price=short_price,
-                    settlement_price=settlement_price,
-                    yesterday_settlement_price=yesterday_settlement_price,
-                    margin_occupied=margin_occupied,
-                    source_file=source_file,
-                    source_section="期权持仓汇总",
-                    raw_line_no=raw_line_no,
-                )
-            )
-
-        return results
-
-    def is_valid_option_position_row(
-        self,
-        instrument_code: Optional[str],
-        option_type_text: Optional[str],
-        strike_price: Optional[Decimal],
-        row: pd.Series,
-    ) -> bool:
-        if not instrument_code:
-            return False
-
-        invalid_texts = [
-            "大连商品交易所",
-            "郑州商品交易所",
-            "上海期货交易所",
-            "中国金融期货交易所",
-            "广州期货交易所",
-            "合计",
-            "小计",
-            "总计",
-            "行权明细",
-            "履约明细",
-            "交割明细",
-        ]
-        if any(x in instrument_code for x in invalid_texts):
-            return False
-
-        if option_type_text not in ("看涨期权", "看跌期权"):
-            return False
-
-        if strike_price is None:
-            return False
-
-        long_qty = self.get_int_value(row, "买持仓")
-        short_qty = self.get_int_value(row, "卖持仓")
-        return (long_qty and long_qty > 0) or (short_qty and short_qty > 0)
-
-    # =========================
-    # 行权明细（嵌在日报）
-    # =========================
-    def parse_option_exercise_details_from_daily_sheet(
+    # ------------------------------------------------------------------
+    # Close and exercise statements
+    # ------------------------------------------------------------------
+    def parse_position_closed(
         self,
         file_path: Path,
-        account_id: str | None = None,
-    ) -> list[OptionExerciseDetail]:
-        """
-        按当前结算单格式解析“期权行权明细”区块。
-        """
-        df_raw = pd.read_excel(file_path, sheet_name="客户交易结算日报", header=None)
-
-        title_row_index = None
-        header_row_index = None
-
-        for i in range(len(df_raw)):
-            row_values = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[i].tolist()]
-            joined = "".join(row_values).replace(" ", "")
-
-            if "期权行权明细" in joined:
-                title_row_index = i
-                break
-
-        if title_row_index is None:
+        account_id: str | None,
+    ) -> list[PositionClosed]:
+        sheet_name = "平仓明细"
+        df, header_row = self.read_table(file_path, sheet_name, ["合约", "成交序号", "买/卖", "成交价", "开仓价"])
+        if df is None:
             return []
 
-        for i in range(title_row_index + 1, min(title_row_index + 5, len(df_raw))):
-            row_values = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[i].tolist()]
-            required = ["交易所", "品种合约", "标的合约", "执行价", "行权日期", "买/卖", "成交量", "手续费"]
-
-            if sum(1 for k in required if k in row_values) >= 5:
-                header_row_index = i
-                break
-
-        if header_row_index is None:
-            return []
-
-        sub_df = df_raw.iloc[header_row_index + 1:].copy()
-        sub_df.columns = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[header_row_index].tolist()]
-        sub_df = sub_df.dropna(how="all")
-
-        details: list[OptionExerciseDetail] = []
-        trade_date = self.parse_trade_date_from_filename(file_path.name)
-
-        for idx, row in sub_df.iterrows():
-            exchange = self.get_str_value(row, "交易所")
-            instrument_code = self.get_str_value(row, "品种合约")
-
-            if exchange == "合计" or instrument_code == "合计":
-                break
-
-            if not exchange and not instrument_code:
+        rows: list[PositionClosed] = []
+        for idx, row in df.iterrows():
+            instrument = self.get_text(row, "合约")
+            if not instrument or self.is_summary(instrument):
                 continue
-
-            quantity = self.get_int_value(row, "成交量")
-            if not exchange or not instrument_code or quantity is None:
+            lots = self.get_decimal(row, "手数")
+            if self.is_zero_or_none(lots):
                 continue
-
-            details.append(
-                OptionExerciseDetail(
-                    trade_date=trade_date,
+            raw_line_no = int(idx) + header_row + 2
+            rows.append(
+                PositionClosed(
+                    close_date=self.date8(self.get_value(row, "实际成交日期")) or self.trade_date_from_file(file_path.name),
+                    product=self.product_from_instrument(instrument),
+                    instrument=instrument,
+                    b_s=self.map_buy_sell(self.get_text(row, "买/卖")),
+                    lots=lots,
+                    pos_open_price=self.get_decimal(row, "开仓价"),
+                    prev_sttl=self.get_decimal(row, "昨结算价"),
+                    trans_price=self.get_decimal(row, "成交价"),
+                    realized_p_l=self.get_decimal(row, "平仓盈亏"),
                     account_id=account_id,
-                    exchange=exchange,
-                    instrument_code=instrument_code,
-                    underlying=self.get_str_value(row, "标的合约"),
-                    direction=self.map_direction(self.get_str_value(row, "买/卖")),
-                    exercise_type="行权",
-                    quantity=quantity,
-                    price=self.get_decimal_value(row, "执行价"),
-                    amount=self.get_decimal_value(row, "行权盈亏"),
-                    commission=self.get_decimal_value(row, "手续费"),
+                    source_file=file_path.name,
+                    sheet_name=sheet_name,
+                    raw_line_no=raw_line_no,
+                    row_hash=self.row_hash(file_path.name, sheet_name, raw_line_no, row),
+                    raw_payload=self.json_payload(row.to_dict()),
+                )
+            )
+        return rows
+
+    def parse_exercise_statement(
+        self,
+        file_path: Path,
+        account_id: str | None,
+    ) -> list[ExerciseStatement]:
+        sheet_name = "客户交易结算日报"
+        df = self.read_sheet(file_path, sheet_name)
+        title_row = self.find_section_title_row(df, "期权行权明细")
+        if title_row is None:
+            return []
+
+        header_row = None
+        for i in range(title_row + 1, min(title_row + 6, len(df))):
+            values = self.row_values(df.iloc[i])
+            if sum(1 for key in ["交易所", "品种合约", "买/卖", "成交量", "手续费"] if key in values) >= 4:
+                header_row = i
+                break
+        if header_row is None:
+            return []
+
+        header = self.row_values(df.iloc[header_row])
+        rows: list[ExerciseStatement] = []
+        for idx in range(header_row + 1, len(df)):
+            row = pd.Series(df.iloc[idx].values, index=header)
+            instrument = self.get_text(row, "品种合约")
+            if not instrument:
+                continue
+            if self.is_summary(instrument) or self.get_text(row, "交易所") == "合计":
+                break
+            lots = self.get_decimal(row, "成交量")
+            if self.is_zero_or_none(lots):
+                continue
+            raw_line_no = idx + 1
+            rows.append(
+                ExerciseStatement(
+                    date=self.date8(self.get_value(row, "行权日期")) or self.trade_date_from_file(file_path.name),
+                    exchange=self.get_text(row, "交易所"),
+                    product=self.product_from_instrument(instrument),
+                    instrument=instrument,
+                    b_s=self.map_buy_sell(self.get_text(row, "买/卖")),
+                    strike_price=self.get_decimal(row, "执行价"),
+                    exercise_price=self.get_decimal(row, "执行价"),
+                    lots=lots,
+                    turnover=self.get_decimal(row, "行权盈亏"),
+                    exercise_p_l=self.get_decimal(row, "行权盈亏"),
+                    exercise_fee=self.get_decimal(row, "手续费"),
+                    account_id=account_id,
                     source_file=file_path.name,
                     source_section="期权行权明细",
-                    raw_line_no=idx + 1,
+                    raw_line_no=raw_line_no,
+                    row_hash=self.row_hash(file_path.name, "期权行权明细", raw_line_no, row),
+                    raw_payload=self.json_payload(row.to_dict()),
                 )
             )
-
-        return details
-
-    # =========================
-    # 持仓快照：由明细聚合
-    # =========================
-    def aggregate_position_details(
-        self,
-        position_details: list[PositionDetail],
-    ) -> list[PositionSnapshot]:
-        grouped = {}
-
-        for pos in position_details:
-            key = (
-                pos.account_id,
-                pos.trade_date,
-                pos.instrument_code,
-                pos.direction,
-            )
-
-            if key not in grouped:
-                grouped[key] = {
-                    "trade_date": pos.trade_date,
-                    "account_id": pos.account_id,
-                    "instrument_code": pos.instrument_code,
-                    "instrument_name": pos.instrument_name,
-                    "asset_type": pos.asset_type,
-                    "direction": pos.direction,
-                    "open_interest": 0,
-                    "avg_open_price_amount": Decimal("0"),
-                    "settlement_price": pos.settlement_price,
-                    "unrealized_pnl": Decimal("0"),
-                    "margin_occupied": Decimal("0"),
-                    "source_file": pos.source_file,
-                }
-
-            item = grouped[key]
-            qty = pos.open_interest or 0
-            avg_price = pos.avg_open_price or Decimal("0")
-
-            item["open_interest"] += qty
-            item["avg_open_price_amount"] += avg_price * qty
-
-            if pos.unrealized_pnl:
-                item["unrealized_pnl"] += pos.unrealized_pnl
-
-            if pos.margin_occupied:
-                item["margin_occupied"] += pos.margin_occupied
-
-            if pos.settlement_price is not None:
-                item["settlement_price"] = pos.settlement_price
-
-        results: list[PositionSnapshot] = []
-
-        for item in grouped.values():
-            qty = item["open_interest"]
-            avg_open_price = None
-            if qty > 0:
-                avg_open_price = item["avg_open_price_amount"] / Decimal(str(qty))
-
-            results.append(
-                PositionSnapshot(
-                    trade_date=item["trade_date"],
-                    account_id=item["account_id"],
-                    instrument_code=item["instrument_code"],
-                    instrument_name=item["instrument_name"],
-                    asset_type=item["asset_type"],
-                    direction=item["direction"],
-                    open_interest=item["open_interest"],
-                    avg_open_price=avg_open_price,
-                    settlement_price=item["settlement_price"],
-                    unrealized_pnl=item["unrealized_pnl"] or None,
-                    margin_occupied=item["margin_occupied"] or None,
-                    source_file=item["source_file"],
-                )
-            )
-
-        return results
-
-    # =========================
-    # 账户日报
-    # =========================
-    def parse_accounts(self, file_path: Path) -> list[AccountDailySnapshot]:
-        df = pd.read_excel(file_path, sheet_name="客户交易结算日报", header=None)
-
-        data_map = self.extract_key_value_pairs(df)
-        other_fund_map = self.extract_other_fund_details(df)
-
-        trade_date = self.parse_trade_date_from_filename(file_path.name)
-
-        begin_balance = self.get_decimal_from_map(data_map, "上日结存")
-        end_balance = self.get_decimal_from_map(data_map, "当日结存")
-        deposit_withdrawal_total = self.get_decimal_from_map(data_map, "当日存取合计")
-
-        deposit = None
-        withdrawal = None
-        if deposit_withdrawal_total is not None:
-            if deposit_withdrawal_total >= 0:
-                deposit = deposit_withdrawal_total
-                withdrawal = Decimal("0")
-            else:
-                deposit = Decimal("0")
-                withdrawal = abs(deposit_withdrawal_total)
-
-        total_commission = self.get_decimal_from_map(data_map, "当日手续费")
-        futures_commission = other_fund_map.get("交易手续费")
-        exercise_commission = other_fund_map.get("行权手续费")
-
-        if futures_commission is not None:
-            futures_commission = abs(futures_commission)
-        if exercise_commission is not None:
-            exercise_commission = abs(exercise_commission)
-
-        option_commission = None
-        if total_commission is not None:
-            futures_val = futures_commission or Decimal("0")
-            exercise_val = exercise_commission or Decimal("0")
-            option_commission = total_commission - futures_val - exercise_val
-
-        account = AccountDailySnapshot(
-            trade_date=trade_date,
-            account_id=self.get_str_from_map(data_map, "客户期货期权内部资金账户"),
-            broker=self.get_str_from_map(data_map, "期货公司名称"),
-
-            # 兼容旧字段
-            begin_client_equity=begin_balance,
-            end_client_equity=end_balance,
-
-            # 原始日报字段
-            begin_balance=begin_balance,
-            deposit=deposit,
-            withdrawal=withdrawal,
-            premium=self.get_decimal_from_map(data_map, "当日总权利金"),
-            non_fx_pledge=self.get_decimal_from_map(data_map, "非货币充抵金额"),
-            fx_pledge=self.get_decimal_from_map(data_map, "货币充抵金额"),
-            frozen_cash=self.get_decimal_from_map(data_map, "冻结资金"),
-            margin_call=self.get_decimal_from_map(data_map, "追加保证金"),
-
-            # 资金风险字段
-            available_fund=self.get_decimal_from_map(data_map, "可用资金"),
-            margin_occupied=self.get_decimal_from_map(data_map, "保证金占用"),
-            realized_pnl=self.get_decimal_from_map(data_map, "当日盈亏"),
-            commission=self.get_value_from_sheet(df, "当日手续费"),
-            option_commission=option_commission,
-            exercise_commission=exercise_commission,
-            risk_degree=self.get_percent_from_map(data_map, "风险度"),
-            source_file=file_path.name,
-        )
-
-        return [account]
-
-    def extract_key_value_pairs(self, df: pd.DataFrame) -> dict:
-        result = {}
-
-        for i in range(len(df)):
-            for j in range(len(df.columns)):
-                key = df.iat[i, j]
-
-                if pd.isna(key):
-                    continue
-
-                key_str = str(key).strip()
-                if not key_str:
-                    continue
-
-                value = None
-                for k in range(j + 1, len(df.columns)):
-                    v = df.iat[i, k]
-                    if not pd.isna(v):
-                        value = v
-                        break
-
-                if value is not None:
-                    result[key_str] = value
-
-        return result
-
-    def extract_other_fund_details(self, df: pd.DataFrame) -> dict:
-        """
-        从“其它资金明细”中提取交易手续费、行权手续费。
-        """
-        result = {
-            "交易手续费": Decimal("0"),
-            "行权手续费": Decimal("0"),
-        }
-
-        start_row = None
-        for i in range(len(df)):
-            row = [str(v).strip() if v is not None else "" for v in df.iloc[i].tolist()]
-            normalized = [cell.replace(" ", "") for cell in row]
-            if any("其它资金明细" in cell for cell in normalized):
-                start_row = i
-                break
-
-        if start_row is None:
-            return result
-
-        header_row = start_row + 1
-        sub_df = df.iloc[header_row + 1: min(header_row + 10, len(df))].copy()
-        sub_df.columns = [str(v).strip() for v in df.iloc[header_row].tolist()]
-        sub_df = sub_df.dropna(how="all")
-
-        if "类型" not in sub_df.columns or "金额" not in sub_df.columns:
-            return result
-
-        for _, row in sub_df.iterrows():
-            date_val = str(row["发生日期"]).strip() if "发生日期" in sub_df.columns and row["发生日期"] is not None else ""
-            fee_type = str(row["类型"]).strip() if row["类型"] is not None else ""
-            amount_val = row["金额"]
-
-            if not fee_type or pd.isna(amount_val):
-                continue
-
-            if date_val == "合计":
-                continue
-
-            if fee_type in result:
-                try:
-                    result[fee_type] += Decimal(str(amount_val).replace(",", "").strip())
-                except Exception:
-                    continue
-
-        return result
-
-    # =========================
-    # 校验
-    # =========================
-    def validate_result(
-        self,
-        trades: list[TradeExecution],
-        accounts: list[AccountDailySnapshot],
-    ) -> dict:
-        futures_commission = Decimal("0")
-        option_trade_commission = Decimal("0")
-
-        for trade in trades:
-            if trade.commission is None:
-                continue
-
-            if trade.asset_type == "option":
-                option_trade_commission += abs(trade.commission)
-            else:
-                futures_commission += abs(trade.commission)
-
-        account_total = None
-        exercise_commission = Decimal("0")
-
-        if accounts:
-            acc = accounts[0]
-            account_total = acc.commission
-            exercise_commission = acc.exercise_commission or Decimal("0")
-
-        total_calc = futures_commission + option_trade_commission + exercise_commission
-
-        diff = None
-        is_match = None
-        if account_total is not None:
-            diff = total_calc - account_total
-            is_match = abs(diff) <= Decimal("0.01")
-
-        return {
-            "commission_check": {
-                "futures": futures_commission,
-                "option": option_trade_commission,
-                "exercise": exercise_commission,
-                "total_calc": total_calc,
-                "account": account_total,
-                "diff": diff,
-                "is_match": is_match,
-            }
-        }
-
-    # =========================
-    # 通用工具
-    # =========================
-    def clean_dataframe_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.dropna(how="all")
-        df.columns = [str(col).strip() for col in df.columns]
-        return df
-
-    def get_str_value(self, row: pd.Series, column_name: str) -> Optional[str]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        if isinstance(value, (int, float)):
-            if float(value).is_integer():
-                return str(int(value))
-            return str(value).strip()
-
-        value = str(value).strip()
-        return value if value else None
-
-    def get_decimal_value(self, row: pd.Series, column_name: str) -> Optional[Decimal]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        try:
-            text = str(value).replace(",", "").strip()
-            if text == "":
-                return None
-            return Decimal(text)
-        except Exception:
-            return None
-
-    def get_int_value(self, row: pd.Series, column_name: str) -> Optional[int]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        try:
-            return int(float(value))
-        except Exception:
-            return None
-
-    def get_datetime_value(
-        self,
-        row: pd.Series,
-        column_name: str,
-        trade_date,
-    ) -> Optional[datetime]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        text = str(value).strip()
-        if not text:
-            return None
-
-        try:
-            time_obj = datetime.strptime(text, "%H:%M:%S").time()
-            return datetime.combine(trade_date, time_obj)
-        except Exception:
-            pass
-
-        try:
-            return pd.to_datetime(value).to_pydatetime()
-        except Exception:
-            return None
-
-    def map_direction(self, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-
-        mapping = {
-            "买": "buy",
-            "卖": "sell",
-        }
-        return mapping.get(value.strip(), value)
-
-    def map_open_close(self, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-
-        mapping = {
-            "开": "open",
-            "平": "close",
-            "平今": "close_today",
-            "平昨": "close_yesterday",
-        }
-        return mapping.get(value.strip(), value)
-
-    def parse_trade_date_from_filename(self, filename: str):
-        """
-        从文件名中提取交易日，例如：
-        016081183126_2026-04-13.xlsx -> 2026-04-13
-        """
-        match = re.search(r"(\d{4}-\d{2}-\d{2})", filename)
-        if not match:
-            raise ValueError(f"无法从文件名提取交易日期: {filename}")
-
-        return datetime.strptime(match.group(1), "%Y-%m-%d").date()
-
-    # =========================
-    # 账户日报
-    # =========================
-    def parse_accounts(self, file_path: Path) -> list[AccountDailySnapshot]:
-        """
-        解析“客户交易结算日报”中的账户资金快照。
-
-        说明：
-        1. begin_client_equity 继续保留，兼容旧逻辑
-        2. begin_balance / premium / pledge / frozen_cash / margin_call 等字段补齐
-        3. 当日存取合计拆为 deposit / withdrawal
-        """
-        sheet_name = "客户交易结算日报"
-        df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
-
-        data_map = self.extract_key_value_pairs(df)
-        other_fund_map = self.extract_other_fund_details(df)
-
-        trade_date = self.parse_trade_date_from_filename(file_path.name)
-
-        # ===== 原始日报字段 =====
-        begin_balance = self.get_decimal_from_map(data_map, "上日结存")
-        end_balance = self.get_decimal_from_map(data_map, "当日结存")
-        net_deposit = self.get_decimal_from_map(data_map, "当日存取合计")
-        premium = self.get_decimal_from_map(data_map, "当日总权利金")
-        non_fx_pledge = self.get_decimal_from_map(data_map, "非货币充抵金额")
-        fx_pledge = self.get_decimal_from_map(data_map, "货币充抵金额")
-        frozen_cash = self.get_decimal_from_map(data_map, "冻结资金")
-        margin_call = self.get_decimal_from_map(data_map, "追加保证金")
-
-        deposit, withdrawal = self.split_net_deposit_withdrawal(net_deposit)
-
-        # ===== 手续费相关 =====
-        total_commission = self.get_decimal_from_map(data_map, "当日手续费")
-        futures_commission = other_fund_map.get("交易手续费")
-        exercise_commission = other_fund_map.get("行权手续费")
-
-        if futures_commission is not None:
-            futures_commission = abs(futures_commission)
-
-        if exercise_commission is not None:
-            exercise_commission = abs(exercise_commission)
-
-        option_commission = None
-        if total_commission is not None:
-            futures_val = futures_commission or Decimal("0")
-            exercise_val = exercise_commission or Decimal("0")
-            option_commission = total_commission - futures_val - exercise_val
-
-        account = AccountDailySnapshot(
-            trade_date=trade_date,
-            account_id=self.get_str_from_map(data_map, "客户期货期权内部资金账户"),
-            broker=self.get_str_from_map(data_map, "期货公司名称"),
-
-            # 兼容旧字段
-            begin_client_equity=begin_balance,
-            end_client_equity=end_balance,
-
-            # 原始日报字段
-            begin_balance=begin_balance,
-            deposit=deposit,
-            withdrawal=withdrawal,
-            premium=premium,
-            non_fx_pledge=non_fx_pledge,
-            fx_pledge=fx_pledge,
-            frozen_cash=frozen_cash,
-            margin_call=margin_call,
-
-            # 资金 / 风险
-            available_fund=self.get_decimal_from_map(data_map, "可用资金"),
-            margin_occupied=self.get_decimal_from_map(data_map, "保证金占用"),
-            realized_pnl=self.get_decimal_from_map(data_map, "当日盈亏"),
-            commission=total_commission,
-            option_commission=option_commission,
-            exercise_commission=exercise_commission,
-            risk_degree=self.get_percent_from_map(data_map, "风险度"),
-            source_file=file_path.name,
-        )
-
-        return [account]
-
-    def split_net_deposit_withdrawal(
-        self,
-        net_amount: Optional[Decimal],
-    ) -> tuple[Optional[Decimal], Optional[Decimal]]:
-        """
-        将“当日存取合计”拆分成：
-        - deposit：入金
-        - withdrawal：出金
-
-        约定：
-        - 正数 -> 入金
-        - 负数 -> 出金（取绝对值）
-        - 0 / None -> 两者都为 0 或 None
-        """
-        if net_amount is None:
-            return None, None
-
-        if net_amount > 0:
-            return net_amount, Decimal("0")
-
-        if net_amount < 0:
-            return Decimal("0"), abs(net_amount)
-
-        return Decimal("0"), Decimal("0")
-
-    def extract_key_value_pairs(self, df: pd.DataFrame) -> dict:
-        """
-        从日报中提取“键值对”型字段。
-        做法：
-        - 扫描每一个非空单元格作为 key
-        - 向右找第一个非空值作为 value
-        """
-        result = {}
-
-        for i in range(len(df)):
-            for j in range(len(df.columns)):
-                key = df.iat[i, j]
-
-                if pd.isna(key):
-                    continue
-
-                key_str = str(key).strip()
-                if not key_str:
-                    continue
-
-                value = None
-                for k in range(j + 1, len(df.columns)):
-                    v = df.iat[i, k]
-                    if not pd.isna(v):
-                        value = v
-                        break
-
-                if value is not None:
-                    result[key_str] = value
-
-        return result
-
-    def extract_other_fund_details(self, df: pd.DataFrame) -> dict:
-        """
-        从“其它资金明细”区块中提取手续费相关项。
-
-        当前只关心：
-        - 交易手续费
-        - 行权手续费
-        """
-        result = {
-            "交易手续费": Decimal("0"),
-            "行权手续费": Decimal("0"),
-        }
-
-        start_row = None
-
-        for i in range(len(df)):
-            row = [str(v).strip() if v is not None else "" for v in df.iloc[i].tolist()]
-            normalized = [cell.replace(" ", "") for cell in row]
-
-            if any("其它资金明细" in cell for cell in normalized):
-                start_row = i
-                break
-
-        if start_row is None:
-            return result
-
-        header_row = start_row + 1
-        sub_df = df.iloc[header_row + 1: min(header_row + 12, len(df))].copy()
-        sub_df.columns = [str(v).strip() for v in df.iloc[header_row].tolist()]
-        sub_df = sub_df.dropna(how="all")
-
-        if "类型" not in sub_df.columns or "金额" not in sub_df.columns:
-            return result
-
-        for _, row in sub_df.iterrows():
-            date_val = (
-                str(row["发生日期"]).strip()
-                if "发生日期" in sub_df.columns and row["发生日期"] is not None
-                else ""
-            )
-            fee_type = str(row["类型"]).strip() if row["类型"] is not None else ""
-            amount_val = row["金额"]
-
-            if not fee_type or pd.isna(amount_val):
-                continue
-
-            if date_val == "合计":
-                continue
-
-            if fee_type in result:
-                try:
-                    result[fee_type] += Decimal(str(amount_val).replace(",", "").strip())
-                except Exception:
-                    continue
-
-        return result
-
-    # =========================
-    # 行权明细（嵌在日报）
-    # =========================
-    def parse_option_exercise_details_from_daily_sheet(
+        return rows
+
+    # ------------------------------------------------------------------
+    # Positions
+    # ------------------------------------------------------------------
+    def parse_futures_positions_detail(
         self,
         file_path: Path,
-        account_id: str | None = None,
-    ) -> list[OptionExerciseDetail]:
-        """
-        从“客户交易结算日报”中解析“期权行权明细”区块。
+        account_id: str | None,
+    ) -> list[PositionsDetail]:
+        sheet_name = "持仓明细"
+        df, header_row = self.read_table(file_path, sheet_name, ["合约", "买持仓", "卖持仓", "今结算价"])
+        if df is None:
+            return []
 
-        当前按已验证过的格式处理：
-        标题行 -> 表头行 -> 数据行 -> 合计结束
-        """
+        rows: list[PositionsDetail] = []
+        for idx, row in df.iterrows():
+            instrument = self.get_text(row, "合约")
+            if not instrument or self.is_summary(instrument):
+                continue
+            raw_line_no = int(idx) + header_row + 2
+            common = {
+                "date": self.trade_date_from_file(file_path.name),
+                "product": self.product_from_instrument(instrument),
+                "instrument": instrument,
+                "open_date": self.date8(self.get_value(row, "实际成交日期")),
+                "s_h": self.map_hedge(self.get_text(row, "投机（一般）/套保/套利")),
+                "prev_sttl": self.get_decimal(row, "昨结算价"),
+                "settlement_price": self.get_decimal(row, "今结算价"),
+                "accum_p_l": self.get_decimal(row, "持仓盈亏"),
+                "mtm_p_l": self.get_decimal(row, "持仓盈亏"),
+                "account_id": account_id,
+                "source_file": file_path.name,
+                "source_section": sheet_name,
+                "raw_line_no": raw_line_no,
+                "row_hash": self.row_hash(file_path.name, sheet_name, raw_line_no, row),
+                "raw_payload": self.json_payload(row.to_dict()),
+            }
+            buy_qty = self.get_decimal(row, "买持仓")
+            sell_qty = self.get_decimal(row, "卖持仓")
+            if buy_qty and buy_qty > 0:
+                rows.append(
+                    PositionsDetail(
+                        **common,
+                        b_s="买",
+                        position_qty=buy_qty,
+                        pos_open_price=self.get_decimal(row, "买入价"),
+                    )
+                )
+            if sell_qty and sell_qty > 0:
+                rows.append(
+                    PositionsDetail(
+                        **common,
+                        b_s="卖",
+                        position_qty=sell_qty,
+                        pos_open_price=self.get_decimal(row, "卖出价"),
+                    )
+                )
+        return rows
+
+    def parse_option_positions_detail(
+        self,
+        file_path: Path,
+        account_id: str | None,
+    ) -> list[PositionsDetail]:
         sheet_name = "客户交易结算日报"
-        df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
-
-        title_row_index = None
-        header_row_index = None
-
-        # 1. 找标题
-        for i in range(len(df_raw)):
-            row_values = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[i].tolist()]
-            joined = "".join(row_values).replace(" ", "")
-
-            if "期权行权明细" in joined:
-                title_row_index = i
-                break
-
-        if title_row_index is None:
+        df = self.read_sheet(file_path, sheet_name)
+        title_row = self.find_section_title_row(df, "期权持仓汇总")
+        if title_row is None or title_row + 1 >= len(df):
             return []
 
-        # 2. 找表头
-        for i in range(title_row_index + 1, min(title_row_index + 5, len(df_raw))):
-            row_values = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[i].tolist()]
-            required = ["交易所", "品种合约", "标的合约", "执行价", "行权日期", "买/卖", "成交量", "手续费"]
-            hit_count = sum(1 for k in required if k in row_values)
-
-            if hit_count >= 5:
-                header_row_index = i
+        header_row = title_row + 1
+        header = self.row_values(df.iloc[header_row])
+        rows: list[PositionsDetail] = []
+        for idx in range(header_row + 1, len(df)):
+            values = self.row_values(df.iloc[idx])
+            joined = "".join(values).replace(" ", "")
+            if not any(values) or "按合同规定" in joined:
                 break
-
-        if header_row_index is None:
-            return []
-
-        # 3. 数据区
-        sub_df = df_raw.iloc[header_row_index + 1:].copy()
-        sub_df.columns = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[header_row_index].tolist()]
-        sub_df = sub_df.dropna(how="all")
-
-        details: list[OptionExerciseDetail] = []
-        trade_date = self.parse_trade_date_from_filename(file_path.name)
-        source_file = file_path.name
-
-        for idx, row in sub_df.iterrows():
-            exchange = self.get_str_value(row, "交易所")
-            instrument_code = self.get_str_value(row, "品种合约")
-
-            # 遇到合计行，停止
-            if exchange == "合计" or instrument_code == "合计":
-                break
-
-            # 空行跳过
-            if not exchange and not instrument_code:
+            row = pd.Series(df.iloc[idx].values, index=header)
+            instrument = self.get_text(row, "品种合约")
+            if not instrument or self.is_summary(instrument):
                 continue
 
-            underlying = self.get_str_value(row, "标的合约")
-            direction_raw = self.get_str_value(row, "买/卖")
-            quantity = self.get_int_value(row, "成交量")
-            commission = self.get_decimal_value(row, "手续费")
-            amount = self.get_decimal_value(row, "行权盈亏")
-            price = self.get_decimal_value(row, "执行价")
+            raw_line_no = idx + 1
+            common = {
+                "date": self.trade_date_from_file(file_path.name),
+                "trading_code": self.get_text(row, "交易编码"),
+                "product": self.product_from_instrument(instrument),
+                "instrument": instrument,
+                "s_h": "一般",
+                "prev_sttl": self.get_decimal(row, "昨结算价"),
+                "settlement_price": self.get_decimal(row, "今结算价"),
+                "margin": self.get_decimal(row, "交易保证金"),
+                "account_id": account_id,
+                "source_file": file_path.name,
+                "source_section": "期权持仓汇总",
+                "raw_line_no": raw_line_no,
+                "row_hash": self.row_hash(file_path.name, "期权持仓汇总", raw_line_no, row),
+                "raw_payload": self.json_payload(row.to_dict()),
+            }
+            buy_qty = self.get_decimal(row, "买持仓")
+            sell_qty = self.get_decimal(row, "卖持仓")
+            if buy_qty and buy_qty > 0:
+                rows.append(
+                    PositionsDetail(
+                        **common,
+                        b_s="买",
+                        position_qty=buy_qty,
+                        pos_open_price=self.get_decimal(row, "买均价"),
+                    )
+                )
+            if sell_qty and sell_qty > 0:
+                rows.append(
+                    PositionsDetail(
+                        **common,
+                        b_s="卖",
+                        position_qty=sell_qty,
+                        pos_open_price=self.get_decimal(row, "卖均价"),
+                    )
+                )
+        return rows
 
-            if not exchange or not instrument_code or quantity is None:
-                continue
+    def aggregate_positions(
+        self,
+        details: list[PositionsDetail],
+        trade_date: str,
+        source_file: str,
+    ) -> list[Positions]:
+        grouped: dict[tuple[str | None, str], list[PositionsDetail]] = defaultdict(list)
+        for detail in details:
+            if detail.instrument:
+                grouped[(detail.account_id, detail.instrument)].append(detail)
 
-            details.append(
-                OptionExerciseDetail(
-                    trade_date=trade_date,
+        positions: list[Positions] = []
+        for (account_id, instrument), items in grouped.items():
+            long_items = [x for x in items if x.b_s == "买" and x.position_qty]
+            short_items = [x for x in items if x.b_s == "卖" and x.position_qty]
+            long_pos = sum((x.position_qty or Decimal("0")) for x in long_items) or None
+            short_pos = sum((x.position_qty or Decimal("0")) for x in short_items) or None
+            first = items[0]
+            positions.append(
+                Positions(
+                    date=trade_date,
+                    trading_code=first.trading_code,
+                    product=first.product,
+                    instrument=instrument,
+                    long_pos=long_pos,
+                    avg_buy_price=self.weighted_price(long_items),
+                    short_pos=short_pos,
+                    avg_sell_price=self.weighted_price(short_items),
+                    prev_sttl=first.prev_sttl,
+                    sttl_today=first.settlement_price,
+                    mtm_p_l=sum((x.mtm_p_l or Decimal("0")) for x in items),
+                    margin_occupied=sum((x.margin or Decimal("0")) for x in items) or None,
+                    s_h=first.s_h,
                     account_id=account_id,
-                    exchange=exchange,
-                    instrument_code=instrument_code,
-                    underlying=underlying,
-                    direction=self.map_direction(direction_raw) if direction_raw else direction_raw,
-                    exercise_type="行权",
-                    quantity=quantity,
-                    price=price,
-                    amount=amount,
-                    commission=commission,
                     source_file=source_file,
-                    source_section="期权行权明细",
-                    raw_line_no=idx + 1,
+                    source_section="positions_detail",
+                    raw_payload=self.json_payload([x.model_dump(mode="json") for x in items]),
                 )
             )
+        return positions
 
-        return details
-
-    # =========================
-    # 校验
-    # =========================
-    def validate_result(
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+    def validate_commission(
         self,
-        trades: list[TradeExecution],
-        accounts: list[AccountDailySnapshot],
-    ) -> dict:
-        """
-        当前只保留“手续费总额校验”，不在 ETL 中做更复杂勾稽。
-        """
-        result = {}
+        parsed: dict[str, Any],
+        trade_date: str,
+        account_id: str | None,
+        source_file: str,
+    ) -> list[ValidationResult]:
+        account_rows = parsed.get("account_summary", [])
+        account = account_rows[0] if account_rows else None
+        expected = account.commission if account else None
+        if expected is None:
+            return [
+                ValidationResult(
+                    check_name="commission_check",
+                    status="WARN",
+                    details="account commission is missing",
+                    source_file=source_file,
+                    date=trade_date,
+                    account_id=account_id,
+                )
+            ]
 
-        futures_commission = Decimal("0")
-        option_trade_commission = Decimal("0")
-
-        for trade in trades:
-            if trade.commission is None:
-                continue
-
-            if trade.asset_type == "option":
-                option_trade_commission += abs(trade.commission)
-            else:
-                futures_commission += abs(trade.commission)
-
-        account_total = None
-        exercise_commission = Decimal("0")
-
-        if accounts:
-            acc = accounts[0]
-            account_total = acc.commission
-            exercise_commission = acc.exercise_commission or Decimal("0")
-
-        total_calc = futures_commission + option_trade_commission + exercise_commission
-
-        diff = None
-        is_match = None
-        if account_total is not None:
-            diff = total_calc - account_total
-            is_match = abs(diff) <= Decimal("0.01")
-
-        result["commission_check"] = {
-            "futures": futures_commission,
-            "option": option_trade_commission,
-            "exercise": exercise_commission,
-            "total_calc": total_calc,
-            "account": account_total,
-            "diff": diff,
-            "is_match": is_match,
-        }
-
-        return result
-
-    # =========================
-    # 通用工具
-    # =========================
-    def get_str_value(self, row: pd.Series, column_name: str) -> Optional[str]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        if isinstance(value, (int, float)):
-            if float(value).is_integer():
-                return str(int(value))
-            return str(value).strip()
-
-        value = str(value).strip()
-        return value if value else None
-
-    def get_decimal_value(self, row: pd.Series, column_name: str) -> Optional[Decimal]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        try:
-            value_str = str(value).replace(",", "").strip()
-            if value_str == "":
-                return None
-            return Decimal(value_str)
-        except Exception:
-            return None
-
-    def get_int_value(self, row: pd.Series, column_name: str) -> Optional[int]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        try:
-            return int(float(value))
-        except Exception:
-            return None
-
-    def get_datetime_value(
-        self,
-        row: pd.Series,
-        column_name: str,
-        trade_date,
-    ) -> Optional[datetime]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        text = str(value).strip()
-        if not text:
-            return None
-
-        try:
-            time_obj = datetime.strptime(text, "%H:%M:%S").time()
-            return datetime.combine(trade_date, time_obj)
-        except Exception:
-            pass
-
-        try:
-            return pd.to_datetime(value).to_pydatetime()
-        except Exception:
-            return None
-
-    def map_direction(self, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-
-        mapping = {
-            "买": "buy",
-            "卖": "sell",
-        }
-        return mapping.get(value.strip(), value)
-
-    def map_open_close(self, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-
-        mapping = {
-            "开": "open",
-            "平": "close",
-            "平今": "close_today",
-            "平昨": "close_yesterday",
-        }
-        return mapping.get(value.strip(), value)
-
-    def get_decimal_from_map(self, data_map: dict, key: str):
-        """
-        用“规范化字符串包含匹配”取日报字段，兼容冒号、空格等格式差异。
-        """
-        key_norm = self.normalize_text(key)
-
-        for k, v in data_map.items():
-            k_norm = self.normalize_text(k)
-
-            if key_norm in k_norm:
-                try:
-                    return Decimal(str(v).replace(",", "").strip())
-                except Exception:
-                    return None
-
-        return None
-
-    def get_percent_from_map(self, data_map: dict, key: str) -> Optional[Decimal]:
-        value = data_map.get(key)
-        if value is None:
-            return None
-
-        try:
-            text = str(value).replace("%", "").strip()
-            return Decimal(text) / Decimal("100")
-        except Exception:
-            return None
-
-    def get_str_from_map(self, data_map: dict, key: str) -> Optional[str]:
-        value = data_map.get(key)
-        if value is None:
-            return None
-        return str(value).strip()
-
-    def get_trade_no_value(self, row: pd.Series, column_name: str) -> Optional[str]:
-        if column_name not in row.index:
-            return None
-
-        value = row[column_name]
-        if pd.isna(value):
-            return None
-
-        text = str(value).strip()
-        if not text:
-            return None
-
-        if text.endswith(".0"):
-            text = text[:-2]
-
-        return text
-
-    def is_summary_or_invalid_text(self, text: str) -> bool:
-        if not text:
-            return True
-
-        text = str(text).strip()
-
-        invalid_keywords = [
-            "合计",
-            "小计",
-            "总计",
-            "成交明细",
-            "持仓明细",
-            "基本资料",
+        transaction_fee = sum((row.fee or Decimal("0")) for row in parsed.get("transaction_record", []))
+        exercise_fee = sum((row.exercise_fee or Decimal("0")) for row in parsed.get("exercise_statement", []))
+        actual = transaction_fee + exercise_fee
+        diff = actual - expected
+        status = "PASS" if abs(diff) <= Decimal("0.01") else "FAIL"
+        return [
+            ValidationResult(
+                check_name="commission_check",
+                status=status,
+                actual_value=str(actual),
+                expected_value=str(expected),
+                diff_value=str(diff),
+                tolerance="0.01",
+                details=f"transaction_fee={transaction_fee}, exercise_fee={exercise_fee}",
+                source_file=source_file,
+                date=trade_date,
+                account_id=account_id,
+                is_blocking=status == "FAIL",
+            )
         ]
 
-        return any(keyword in text for keyword in invalid_keywords)
+    # ------------------------------------------------------------------
+    # Shared readers and value helpers
+    # ------------------------------------------------------------------
+    def read_sheet(self, file_path: Path, sheet_name: str) -> pd.DataFrame:
+        return pd.read_excel(file_path, sheet_name=sheet_name, header=None)
 
-    def find_section_title_row(self, df_raw: pd.DataFrame, title_keyword: str) -> Optional[int]:
-        for i in range(len(df_raw)):
-            row_values = [str(v).strip() if not pd.isna(v) else "" for v in df_raw.iloc[i].tolist()]
-            joined = "".join(row_values).replace(" ", "")
+    def read_table(
+        self,
+        file_path: Path,
+        sheet_name: str,
+        keywords: list[str],
+    ) -> tuple[pd.DataFrame | None, int]:
+        try:
+            raw = self.read_sheet(file_path, sheet_name)
+        except Exception:
+            return None, -1
+        header_row = self.find_header_row(raw, keywords)
+        if header_row is None:
+            return None, -1
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row, dtype=str)
+        df = df.dropna(how="all")
+        df.columns = [str(c).strip() if not pd.isna(c) else "" for c in df.columns]
+        return df, header_row
+
+    def find_header_row(self, raw: pd.DataFrame, keywords: list[str]) -> int | None:
+        for i in range(len(raw)):
+            values = self.row_values(raw.iloc[i])
+            if sum(1 for key in keywords if key in values) >= min(3, len(keywords)):
+                return i
+        return None
+
+    def find_section_title_row(self, raw: pd.DataFrame, title_keyword: str) -> int | None:
+        for i in range(len(raw)):
+            joined = "".join(self.row_values(raw.iloc[i])).replace(" ", "")
             if title_keyword in joined:
                 return i
         return None
 
-    def build_row_hash(
-        self,
-        source_file: str,
-        sheet_name: str | None,
-        raw_line_no: int | None,
-        row: pd.Series,
-    ) -> str:
-        parts = [source_file or "", sheet_name or "", str(raw_line_no or "")]
-        for column_name, value in row.items():
-            if pd.isna(value):
-                value_text = ""
-            else:
-                value_text = str(value).strip()
-            parts.append(f"{column_name}={value_text}")
+    def extract_key_values(self, df: pd.DataFrame) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for i in range(len(df)):
+            row = df.iloc[i]
+            for j in range(len(row)):
+                key = row.iat[j]
+                if pd.isna(key):
+                    continue
+                key_text = str(key).strip()
+                if not key_text:
+                    continue
+                for k in range(j + 1, len(row)):
+                    value = row.iat[k]
+                    if not pd.isna(value):
+                        result[key_text] = value
+                        break
+        return result
 
+    def extract_other_fund_details(self, df: pd.DataFrame) -> dict[str, Decimal]:
+        result: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        title_row = self.find_section_title_row(df, "其它资金明细")
+        if title_row is None or title_row + 1 >= len(df):
+            return dict(result)
+        header = self.row_values(df.iloc[title_row + 1])
+        if "类型" not in header or "金额" not in header:
+            return dict(result)
+        for idx in range(title_row + 2, min(title_row + 20, len(df))):
+            values = self.row_values(df.iloc[idx])
+            if not any(values):
+                break
+            row = pd.Series(df.iloc[idx].values, index=header)
+            fee_type = self.get_text(row, "类型")
+            if not fee_type or fee_type == "合计":
+                continue
+            amount = self.get_decimal(row, "金额")
+            if amount is not None:
+                result[fee_type] += amount
+        return dict(result)
+
+    def row_values(self, row: pd.Series) -> list[str]:
+        return ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
+
+    def get_value(self, row: pd.Series, column_name: str) -> Any:
+        if column_name not in row.index:
+            return None
+        value = row[column_name]
+        if pd.isna(value):
+            return None
+        return value
+
+    def get_text(self, row: pd.Series, column_name: str) -> str | None:
+        value = self.get_value(row, column_name)
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text.endswith(".0"):
+            text = text[:-2]
+        return text or None
+
+    def get_decimal(self, row: pd.Series, column_name: str) -> Decimal | None:
+        return self.to_decimal(self.get_value(row, column_name))
+
+    def to_decimal(self, value: Any) -> Decimal | None:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).replace(",", "").replace("%", "").strip()
+        if text in {"", "--", "nan", "None"}:
+            return None
+        try:
+            return Decimal(text)
+        except Exception:
+            return None
+
+    def decimal_from_map(self, data_map: dict[str, Any], key: str) -> Decimal | None:
+        key_norm = self.normalize_text(key)
+        for current_key, value in data_map.items():
+            if key_norm in self.normalize_text(current_key):
+                return self.to_decimal(value)
+        return None
+
+    def str_from_map(self, data_map: dict[str, Any], key: str) -> str | None:
+        key_norm = self.normalize_text(key)
+        for current_key, value in data_map.items():
+            if key_norm in self.normalize_text(current_key):
+                text = str(value).strip()
+                if text.endswith(".0"):
+                    text = text[:-2]
+                return text or None
+        return None
+
+    def percent_from_map(self, data_map: dict[str, Any], key: str) -> Decimal | None:
+        return self.decimal_from_map(data_map, key)
+
+    def normalize_text(self, value: Any) -> str:
+        return str(value).replace(" ", "").replace("：", "").replace(":", "").strip()
+
+    def is_zero_or_none(self, value: Decimal | None) -> bool:
+        return value is None or value == 0
+
+    def is_summary(self, text: str) -> bool:
+        return any(keyword in str(text) for keyword in ["合计", "小计", "总计", "基本资料"])
+
+    def date8(self, value: Any) -> str | None:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        match = re.search(r"(\d{4})[-/]?(\d{2})[-/]?(\d{2})", text)
+        if match:
+            return "".join(match.groups())
+        try:
+            return pd.to_datetime(value).strftime("%Y%m%d")
+        except Exception:
+            return None
+
+    def trade_date_from_file(self, filename: str) -> str:
+        match = re.search(r"(\d{4})-(\d{2})-(\d{2})", filename)
+        if not match:
+            raise ValueError(f"无法从文件名提取交易日期: {filename}")
+        return "".join(match.groups())
+
+    def map_buy_sell(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        value = value.strip()
+        mapping = {
+            "买": "买",
+            "卖": "卖",
+            "Buy": "买",
+            "Sell": "卖",
+            "B": "买",
+            "S": "卖",
+        }
+        return mapping.get(value, value)
+
+    def map_open_close(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        value = value.strip()
+        mapping = {
+            "开": "开",
+            "平": "平",
+            "平仓": "平",
+            "平今": "平今",
+            "平昨": "平昨",
+            "Close Today": "平今",
+            "Close Prev.": "平昨",
+            "Open": "开",
+            "Close": "平",
+        }
+        return mapping.get(value, value)
+
+    def map_hedge(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        value = value.strip()
+        mapping = {
+            "投机": "投机",
+            "一般": "一般",
+            "套保": "套保",
+            "套利": "套利",
+            "Speculation": "投机",
+            "General": "一般",
+            "Hedge": "套保",
+            "Arbitrage": "套利",
+        }
+        return mapping.get(value, value)
+
+    def product_from_instrument(self, instrument: str | None) -> str | None:
+        if not instrument:
+            return None
+        match = re.match(r"([A-Za-z]+)", instrument)
+        return match.group(1).upper() if match else None
+
+    def weighted_price(self, items: list[PositionsDetail]) -> Decimal | None:
+        total_qty = sum((x.position_qty or Decimal("0")) for x in items)
+        if total_qty == 0:
+            return None
+        total_amount = sum((x.position_qty or Decimal("0")) * (x.pos_open_price or Decimal("0")) for x in items)
+        return total_amount / total_qty
+
+    def split_signed_amount(self, amount: Decimal | None) -> tuple[Decimal | None, Decimal | None]:
+        if amount is None:
+            return None, None
+        if amount >= 0:
+            return amount, Decimal("0")
+        return Decimal("0"), abs(amount)
+
+    def row_hash(self, source_file: str, sheet_name: str | None, raw_line_no: int | None, row: pd.Series) -> str:
+        parts = [source_file or "", sheet_name or "", str(raw_line_no or "")]
+        for key, value in row.items():
+            if pd.isna(value):
+                text = ""
+            else:
+                text = str(value).strip()
+            parts.append(f"{key}={text}")
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
-    def normalize_text(self, s: str) -> str:
-        return (
-            str(s)
-            .replace(" ", "")
-            .replace("：", "")
-            .replace(":", "")
-            .strip()
-        )
+    def json_payload(self, value: Any) -> str:
+        def default(obj: Any) -> str:
+            return str(obj)
+
+        return json.dumps(value, ensure_ascii=False, default=default)

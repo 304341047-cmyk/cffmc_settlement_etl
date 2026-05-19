@@ -135,7 +135,7 @@ FIFO 处理规则：
 
 ## 样例文件与已知事实
 
-现有样例：
+历史样例（仅作格式参考，不再作为当前验收目标）：
 
 - `data/inbox/016081183126_2026-04-16.xlsx`
 - `data/inbox/016081183126_2026-04-17.xlsx`
@@ -149,6 +149,8 @@ FIFO 处理规则：
 - 2026-04-24 有出金流水，金额为 `100000`。
 - 期权持仓汇总中买/卖持仓依赖空列位置，不能将行内容压缩后再读。
 - 当前 `app/db/trading.db` 是空文件，根目录 `db` 目前未发现实际业务库。
+- 当前验收主账户改为 9277 批次；81183126 不再要求回归。
+- 后续新增账户尽量从 0 持仓日期开始导入；若首日已有持仓但缺少历史成交，严格 FIFO 应暴露为对账失败，而不是自动调平。
 
 ## 明天建议执行顺序
 
@@ -216,3 +218,81 @@ FIFO 处理规则：
 - `TradeSummary`、`CloseDetail` 的具体解析还未接入。
 - 严格失败模式尚未把 blocking `ValidationIssue` 自动升级为整文件失败。
 - 行情 sqlite 查询逻辑已配置化，但尚未接入结算价补全流程；等待行情库补全后继续验证。
+
+## 2026-05-19 进度
+
+- 参照 `D:\CodeProjects\ctp_report\ctp_settlement_etl`，第一阶段已将当前项目业务表/字段统一到 CTP 口径：
+  - `account_summary`
+  - `deposit_withdrawal`
+  - `transaction_record`
+  - `exercise_statement`
+  - `position_closed`
+  - `positions_detail`
+  - `positions`
+  - `validation_result`
+  - `source_file_record`
+- 保留监控中心特有追溯字段：
+  - `source_file`
+  - `raw_payload`
+  - `sheet_name`
+  - `raw_line_no`
+  - `row_hash`
+- 新增/保留 FIFO 扩展表：
+  - `fifo_matches`
+  - `position_lots`
+  - `fifo_positions`
+- `CFFMCSettlementParser` 已改为直接输出 CTP key：
+  - `account_summary`
+  - `deposit_withdrawal`
+  - `transaction_record`
+  - `exercise_statement`
+  - `position_closed`
+  - `positions_detail`
+  - `positions`
+- 已接入 `平仓明细` 到 `position_closed`。
+- `transaction_record` 保留所有原始成交行，不按 `trans_no` 去重；唯一性仍依赖源文件行级追溯字段。
+- 资金字段已按 CTP 口径映射：
+  - `上日结存 -> balance_b_f`
+  - `当日存取合计 -> deposit_withdrawal`
+  - `当日盈亏 -> realized_p_l`
+  - `当日手续费 -> commission`
+  - `行权手续费 -> exercise_fee`
+  - `当日结存 -> balance_c_f`
+  - `客户权益` 缺失时由 `balance_c_f` 回填 `client_equity`
+- FIFO 已改为跨文件延续：
+  - 每个文件处理时加载同账户上一处理日的 `position_lots`
+  - 当日成交生成 `fifo_matches`、新的 `position_lots` 快照和 `fifo_positions`
+  - 账单持仓仍写入 `positions`
+  - `fifo_positions` 与 `positions` 通过 `validation_result.check_name = fifo_position_reconcile` 比对
+- 严格模式已接入：
+  - futures 明确开平的成交严格按 `开/平/平今/平昨` 处理
+  - 无可用 FIFO lot 的平仓会生成 blocking `FAIL`
+  - blocking `FAIL` 会阻断该文件业务数据入库，并将源文件记录为 `FAILED`
+  - 不再自动生成 `seed/adjustment lot` 调平
+- 期权成交明细无 `O/C` 字段，因此采用目标持仓约束推导：
+  - 有反向 lot 时优先 FIFO 平仓
+  - 仅当账单期末需要该方向仓位时，剩余成交量才生成新 lot
+  - 否则该无 `O/C` 期权成交只保留在 `transaction_record`，不造持仓 lot
+
+### 2026-05-19 验证
+
+- 使用临时库 `db/test_unified_fifo_20260519_b.db`，按 archive 中 9277 账户完整批次验证：
+  - 文件数：15
+  - `source_file_record`：15 个 `SUCCESS`
+  - 账户日期范围：`20260413` 到 `20260506`
+  - `20260413`：0 条账单持仓
+  - `transaction_record`：95 条，日期范围 `20260414` 到 `20260430`
+  - `20260506`：`positions` 14 条，`fifo_positions` 14 条
+  - `validation_result` 无 blocking `FAIL`
+  - `position_lots.remaining_volume` 与 `fifo_positions.lots` 每日汇总一致：
+    - `20260427`: 2 = 2
+    - `20260428`: 4 = 4
+    - `20260429`: 37 = 37
+    - `20260430`: 62 = 62
+    - `20260506`: 62 = 62
+
+### 当前未完成/待验证
+
+- 81183126 旧账户不再作为当前验收目标；如后续重新导入，优先寻找该账户 0 持仓起点批次。
+- 当前实现仍保留旧模型文件名作为承载位置，但对外导出的业务类和 ORM 表已切到 CTP 口径；后续可以再做文件级命名清理。
+- 行情 sqlite 结算价补全仍未接入。

@@ -1,189 +1,287 @@
+from __future__ import annotations
+
 from collections import defaultdict, deque
-from datetime import datetime, time
 from decimal import Decimal
 
-from app.models import FifoMatch, PositionLot, PositionSnapshot, TradeExecution, ValidationIssue
+from app.models import FifoMatch, FifoPosition, PositionLot, Positions, TransactionRecord, ValidationResult
 
 
-def _trade_sort_key(trade: TradeExecution):
-    trade_time = trade.trade_time or datetime.combine(trade.trade_date, time.min)
+def generate_fifo(
+    trades: list[TransactionRecord],
+    statement_positions: list[Positions],
+    opening_lots: list[PositionLot] | None = None,
+    source_file: str = "",
+) -> tuple[list[FifoMatch], list[PositionLot], list[FifoPosition], list[ValidationResult]]:
+    lots: dict[tuple[str | None, str, str], deque[dict]] = defaultdict(deque)
+    matches: list[FifoMatch] = []
+    issues: list[ValidationResult] = []
+    target_positions = statement_target_map(statement_positions)
+
+    for lot in opening_lots or []:
+        if lot.remaining_volume and lot.remaining_volume > 0:
+            lots[(lot.account_id, lot.instrument, lot.b_s)].append(lot.model_dump())
+
+    for trade in sorted(trades, key=trade_sort_key):
+        qty = to_decimal(trade.lots)
+        if not trade.instrument or not trade.b_s or qty <= 0:
+            continue
+
+        if trade.o_c == "开":
+            append_open_lot(lots, trade, trade.b_s, qty, source_file)
+            continue
+
+        if trade.o_c in {"平", "平今", "平昨"}:
+            close_side = "买" if trade.b_s == "卖" else "卖"
+            consume_lots(lots, matches, issues, trade, close_side, qty, source_file)
+            continue
+
+        # CFFMC option transaction rows do not expose O/C. From a zero-position
+        # start, strict FIFO can still derive positions by closing opposite lots
+        # first and opening the remaining quantity.
+        opposite_side = "卖" if trade.b_s == "买" else "买"
+        remaining = consume_lots(lots, matches, issues, trade, opposite_side, qty, source_file, allow_shortfall=True)
+        if remaining > 0:
+            key = lot_key(trade.account_id, trade.instrument, trade.b_s)
+            current_qty = current_lot_qty(lots, key)
+            target_qty = target_positions.get(key, Decimal("0"))
+            open_qty = min(remaining, max(Decimal("0"), target_qty - current_qty))
+            if open_qty > 0:
+                append_open_lot(lots, trade, trade.b_s, open_qty, source_file)
+
+    ending_lots = flatten_lots(lots, source_file)
+    fifo_positions = aggregate_fifo_positions(ending_lots, source_file)
+    issues.extend(reconcile_positions(statement_positions, fifo_positions, source_file))
+
+    if not any(issue.status == "FAIL" and issue.is_blocking for issue in issues):
+        account_id = statement_positions[0].account_id if statement_positions else (trades[0].account_id if trades else None)
+        date = statement_positions[0].date if statement_positions else (trades[0].date if trades else None)
+        issues.append(
+            ValidationResult(
+                check_name="fifo_position_reconcile",
+                status="PASS",
+                actual_value=str(len(fifo_positions)),
+                expected_value=str(len(statement_positions)),
+                diff_value="0",
+                tolerance="0",
+                details="FIFO ending positions match statement positions",
+                source_file=source_file,
+                date=date,
+                account_id=account_id,
+                is_blocking=False,
+            )
+        )
+
+    return matches, ending_lots, fifo_positions, issues
+
+
+def trade_sort_key(trade: TransactionRecord):
     return (
-        trade.trade_date,
-        trade_time,
+        trade.date or "",
+        trade.trade_time or "",
         trade.raw_line_no or 0,
     )
 
 
-def _open_lot_direction(trade: TradeExecution) -> str | None:
-    if trade.open_close != "open":
-        return None
-    if trade.direction == "buy":
-        return "long"
-    if trade.direction == "sell":
-        return "short"
-    return None
+def to_decimal(value) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
 
 
-def _close_lot_direction(trade: TradeExecution) -> str | None:
-    if trade.open_close not in {"close", "close_today", "close_yesterday"}:
-        return None
-    if trade.direction == "sell":
-        return "long"
-    if trade.direction == "buy":
-        return "short"
-    return None
+def lot_key(account_id: str | None, instrument: str, b_s: str):
+    return account_id, instrument, b_s
 
 
-def _lot_key(account_id: str | None, instrument_code: str, direction: str):
-    return account_id, instrument_code, direction
+def append_open_lot(
+    lots: dict[tuple[str | None, str, str], deque[dict]],
+    trade: TransactionRecord,
+    b_s: str,
+    qty: Decimal,
+    source_file: str,
+) -> None:
+    lots[lot_key(trade.account_id, trade.instrument, b_s)].append(
+        {
+            "date": trade.date,
+            "account_id": trade.account_id,
+            "instrument": trade.instrument,
+            "b_s": b_s,
+            "lots": qty,
+            "remaining_volume": qty,
+            "pos_open_price": trade.price,
+            "open_time": trade.trade_time,
+            "source_file": source_file or trade.source_file,
+            "source_type": "trade",
+            "source_reason": None,
+            "open_trade_row_hash": trade.row_hash,
+        }
+    )
 
 
-def generate_fifo(
-    trades: list[TradeExecution],
-    positions: list[PositionSnapshot],
-    source_file: str | None = None,
-) -> tuple[list[FifoMatch], list[PositionLot], list[ValidationIssue]]:
-    lots: dict[tuple, deque[dict]] = defaultdict(deque)
-    matches: list[FifoMatch] = []
-    issues: list[ValidationIssue] = []
+def consume_lots(
+    lots: dict[tuple[str | None, str, str], deque[dict]],
+    matches: list[FifoMatch],
+    issues: list[ValidationResult],
+    trade: TransactionRecord,
+    close_side: str,
+    qty: Decimal,
+    source_file: str,
+    allow_shortfall: bool = False,
+) -> Decimal:
+    key = lot_key(trade.account_id, trade.instrument, close_side)
+    remaining = qty
 
-    for trade in sorted(trades, key=_trade_sort_key):
-        open_direction = _open_lot_direction(trade)
-        close_direction = _close_lot_direction(trade)
+    while remaining > 0 and lots.get(key):
+        lot = lots[key][0]
+        lot_remaining = to_decimal(lot.get("remaining_volume"))
+        matched = min(remaining, lot_remaining)
+        pnl_sign = Decimal("1") if close_side == "买" else Decimal("-1")
+        open_price = to_decimal(lot.get("pos_open_price"))
+        close_price = to_decimal(trade.price)
+        realized = (close_price - open_price) * matched * pnl_sign
 
-        if open_direction:
-            key = _lot_key(trade.account_id, trade.instrument_code, open_direction)
-            lots[key].append(
-                {
-                    "trade_date": trade.trade_date,
-                    "account_id": trade.account_id,
-                    "instrument_code": trade.instrument_code,
-                    "asset_type": trade.asset_type,
-                    "direction": open_direction,
-                    "volume": trade.volume,
-                    "remaining_volume": trade.volume,
-                    "open_price": trade.price,
-                    "open_time": trade.trade_time,
-                    "source_file": trade.source_file,
-                    "source_type": "trade",
-                    "source_reason": None,
-                    "open_trade_row_hash": trade.row_hash,
-                }
+        matches.append(
+            FifoMatch(
+                date=trade.date,
+                account_id=trade.account_id,
+                instrument=trade.instrument,
+                b_s=close_side,
+                open_trade_row_hash=lot.get("open_trade_row_hash"),
+                close_trade_row_hash=trade.row_hash,
+                lots=matched,
+                open_price=open_price,
+                close_price=close_price,
+                realized_p_l=realized,
+                source_file=source_file or trade.source_file,
             )
-            continue
+        )
 
-        if not close_direction:
-            continue
+        lot["remaining_volume"] = lot_remaining - matched
+        remaining -= matched
+        if lot["remaining_volume"] <= 0:
+            lots[key].popleft()
 
-        key = _lot_key(trade.account_id, trade.instrument_code, close_direction)
-        remaining_to_close = trade.volume
-
-        if not lots[key]:
-            lots[key].append(
-                {
-                    "trade_date": trade.trade_date,
-                    "account_id": trade.account_id,
-                    "instrument_code": trade.instrument_code,
-                    "asset_type": trade.asset_type,
-                    "direction": close_direction,
-                    "volume": remaining_to_close,
-                    "remaining_volume": remaining_to_close,
-                    "open_price": trade.price,
-                    "open_time": trade.trade_time,
-                    "source_file": trade.source_file,
-                    "source_type": "seed",
-                    "source_reason": "missing_history_for_close",
-                    "open_trade_row_hash": f"seed:{trade.row_hash}",
-                }
+    if remaining > 0 and not allow_shortfall:
+        issues.append(
+            ValidationResult(
+                check_name="fifo_close_without_open_lot",
+                status="FAIL",
+                actual_value=str(qty - remaining),
+                expected_value=str(qty),
+                diff_value=str(remaining),
+                tolerance="0",
+                details=f"{trade.instrument} {trade.b_s}{trade.o_c or ''} has no available {close_side} FIFO lot",
+                source_file=source_file or trade.source_file,
+                date=trade.date,
+                account_id=trade.account_id,
+                is_blocking=True,
             )
+        )
 
-        while remaining_to_close > 0:
-            if not lots[key]:
-                issues.append(
-                    ValidationIssue(
-                        trade_date=trade.trade_date,
-                        account_id=trade.account_id,
-                        source_file=source_file or trade.source_file,
-                        check_name="fifo_close_volume",
-                        message=f"{trade.instrument_code} close volume exceeds available lots",
-                        expected_value=str(trade.volume),
-                        actual_value=str(trade.volume - remaining_to_close),
-                    )
-                )
-                break
+    return remaining
 
-            lot = lots[key][0]
-            matched_volume = min(remaining_to_close, lot["remaining_volume"])
-            pnl_sign = Decimal("1") if close_direction == "long" else Decimal("-1")
-            realized_pnl = (trade.price - lot["open_price"]) * Decimal(str(matched_volume)) * pnl_sign
 
-            matches.append(
-                FifoMatch(
-                    trade_date=trade.trade_date,
-                    account_id=trade.account_id,
-                    instrument_code=trade.instrument_code,
-                    asset_type=trade.asset_type,
-                    direction=close_direction,
-                    open_trade_row_hash=lot["open_trade_row_hash"],
-                    close_trade_row_hash=trade.row_hash,
-                    volume=matched_volume,
-                    open_price=lot["open_price"],
-                    close_price=trade.price,
-                    realized_pnl=realized_pnl,
-                    source_file=source_file or trade.source_file,
-                )
-            )
-
-            lot["remaining_volume"] -= matched_volume
-            remaining_to_close -= matched_volume
-            if lot["remaining_volume"] <= 0:
-                lots[key].popleft()
-
-    expected_positions = {
-        _lot_key(pos.account_id, pos.instrument_code, pos.direction): pos
-        for pos in positions
-        if pos.direction in {"long", "short"} and pos.open_interest > 0
-    }
-
-    for key, pos in expected_positions.items():
-        current_qty = sum(lot["remaining_volume"] for lot in lots.get(key, []))
-        if current_qty < pos.open_interest:
-            adjustment_volume = pos.open_interest - current_qty
-            lots[key].append(
-                {
-                    "trade_date": pos.trade_date,
-                    "account_id": pos.account_id,
-                    "instrument_code": pos.instrument_code,
-                    "asset_type": pos.asset_type,
-                    "direction": pos.direction,
-                    "volume": adjustment_volume,
-                    "remaining_volume": adjustment_volume,
-                    "open_price": pos.avg_open_price or pos.settlement_price or Decimal("0"),
-                    "open_time": None,
-                    "source_file": pos.source_file,
-                    "source_type": "adjustment",
-                    "source_reason": "reconcile_to_statement_position",
-                    "open_trade_row_hash": f"adjustment:{pos.source_file}:{pos.instrument_code}:{pos.direction}",
-                }
-            )
-        elif current_qty > pos.open_interest:
-            issues.append(
-                ValidationIssue(
-                    trade_date=pos.trade_date,
-                    account_id=pos.account_id,
-                    source_file=source_file or pos.source_file,
-                    check_name="fifo_ending_position",
-                    message=f"{pos.instrument_code} FIFO ending lots exceed statement position",
-                    expected_value=str(pos.open_interest),
-                    actual_value=str(current_qty),
-                )
-            )
-
-    position_lots: list[PositionLot] = []
+def flatten_lots(lots: dict[tuple[str | None, str, str], deque[dict]], source_file: str) -> list[PositionLot]:
+    result: list[PositionLot] = []
     for lot_queue in lots.values():
         for lot in lot_queue:
-            if lot["remaining_volume"] <= 0:
+            remaining = to_decimal(lot.get("remaining_volume"))
+            if remaining <= 0:
                 continue
-            position_lots.append(PositionLot(**lot))
+            snapshot = dict(lot)
+            snapshot["date"] = source_date(source_file) or snapshot.get("date")
+            snapshot["source_file"] = source_file or snapshot.get("source_file")
+            snapshot["remaining_volume"] = remaining
+            result.append(PositionLot(**snapshot))
+    return result
 
-    return matches, position_lots, issues
+
+def aggregate_fifo_positions(lots: list[PositionLot], source_file: str) -> list[FifoPosition]:
+    grouped: dict[tuple[str | None, str, str], list[PositionLot]] = defaultdict(list)
+    for lot in lots:
+        grouped[(lot.account_id, lot.instrument, lot.b_s)].append(lot)
+
+    positions: list[FifoPosition] = []
+    for (account_id, instrument, b_s), group in grouped.items():
+        qty = sum((lot.remaining_volume or Decimal("0")) for lot in group)
+        if qty <= 0:
+            continue
+        amount = sum((lot.remaining_volume or Decimal("0")) * (lot.pos_open_price or Decimal("0")) for lot in group)
+        positions.append(
+            FifoPosition(
+                date=group[0].date,
+                account_id=account_id,
+                instrument=instrument,
+                b_s=b_s,
+                lots=qty,
+                avg_open_price=amount / qty if qty else None,
+                source_file=source_file,
+            )
+        )
+    return positions
+
+
+def current_lot_qty(lots: dict[tuple[str | None, str, str], deque[dict]], key: tuple[str | None, str, str]) -> Decimal:
+    return sum((to_decimal(lot.get("remaining_volume")) for lot in lots.get(key, [])), Decimal("0"))
+
+
+def statement_target_map(statement_positions: list[Positions]) -> dict[tuple[str | None, str, str], Decimal]:
+    expected: dict[tuple[str | None, str, str], Decimal] = defaultdict(Decimal)
+    for pos in statement_positions:
+        if not pos.instrument:
+            continue
+        if pos.long_pos and pos.long_pos > 0:
+            expected[(pos.account_id, pos.instrument, "买")] += pos.long_pos
+        if pos.short_pos and pos.short_pos > 0:
+            expected[(pos.account_id, pos.instrument, "卖")] += pos.short_pos
+    return expected
+
+
+def reconcile_positions(
+    statement_positions: list[Positions],
+    fifo_positions: list[FifoPosition],
+    source_file: str,
+) -> list[ValidationResult]:
+    expected = statement_target_map(statement_positions)
+
+    actual: dict[tuple[str | None, str, str], Decimal] = defaultdict(Decimal)
+    for pos in fifo_positions:
+        actual[(pos.account_id, pos.instrument, pos.b_s)] += pos.lots
+
+    issues: list[ValidationResult] = []
+    date = statement_positions[0].date if statement_positions else (fifo_positions[0].date if fifo_positions else source_date(source_file))
+    account_id = statement_positions[0].account_id if statement_positions else (fifo_positions[0].account_id if fifo_positions else None)
+
+    for key in sorted(set(expected) | set(actual), key=lambda item: (item[0] or "", item[1], item[2])):
+        expected_qty = expected.get(key, Decimal("0"))
+        actual_qty = actual.get(key, Decimal("0"))
+        diff = actual_qty - expected_qty
+        if diff == 0:
+            continue
+        _, instrument, b_s = key
+        issues.append(
+            ValidationResult(
+                check_name="fifo_position_reconcile",
+                status="FAIL",
+                actual_value=str(actual_qty),
+                expected_value=str(expected_qty),
+                diff_value=str(diff),
+                tolerance="0",
+                details=f"{instrument} {b_s} FIFO ending position does not match statement",
+                source_file=source_file,
+                date=date,
+                account_id=account_id,
+                is_blocking=True,
+            )
+        )
+    return issues
+
+
+def source_date(source_file: str) -> str | None:
+    import re
+
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", source_file or "")
+    if not match:
+        return None
+    return "".join(match.groups())

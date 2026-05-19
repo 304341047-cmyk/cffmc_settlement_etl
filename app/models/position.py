@@ -1,25 +1,42 @@
-from pydantic import BaseModel, Field
-from typing import Optional
 from decimal import Decimal
-from datetime import date
+
+from pydantic import BaseModel
 
 
-class PositionSnapshot(BaseModel):
-    trade_date: date = Field(..., description="交易日期")
-    account_id: Optional[str] = Field(None, description="账户编号")
-    instrument_code: str = Field(..., description="合约或证券代码")
-    instrument_name: Optional[str] = Field(None, description="合约或证券名称")
-    asset_type: Optional[str] = Field(None, description="资产类型")
+class Positions(BaseModel):
+    date: str | None = None
+    invest_unit: str | None = None
+    trading_code: str | None = None
+    product: str | None = None
+    instrument: str | None = None
+    long_pos: Decimal | None = None
+    avg_buy_price: Decimal | None = None
+    short_pos: Decimal | None = None
+    avg_sell_price: Decimal | None = None
+    prev_sttl: Decimal | None = None
+    sttl_today: Decimal | None = None
+    mtm_p_l: Decimal | None = None
+    margin_occupied: Decimal | None = None
+    s_h: str | None = None
+    market_value_long: Decimal | None = None
+    market_value_short: Decimal | None = None
+    account_id: str | None = None
 
-    direction: Optional[str] = Field(None, description="持仓方向：long/short")
-    open_interest: int = Field(..., description="持仓数量")
-    yesterday_open_interest: Optional[int] = Field(None, description="昨仓数量")
+    source_file: str = ""
+    raw_payload: str | None = None
+    source_section: str | None = None
+    raw_line_no: int | None = None
+    row_hash: str | None = None
 
-    avg_open_price: Optional[Decimal] = Field(None, description="开仓均价")
-    settlement_price: Optional[Decimal] = Field(None, description="结算价")
-    realized_pnl: Optional[Decimal] = Field(None, description="期货平仓盈亏")
-    unrealized_pnl: Optional[Decimal] = Field(None, description="持仓盯市盈亏")
-    option_pnl: Optional[Decimal] = Field(None, description="期权浮动盈亏")
-    margin_occupied: Optional[Decimal] = Field(None, description="占用保证金")
 
-    source_file: Optional[str] = Field(None, description="来源文件名")
+class FifoPosition(BaseModel):
+    date: str | None = None
+    account_id: str | None = None
+    instrument: str
+    b_s: str
+    lots: Decimal
+    avg_open_price: Decimal | None = None
+    source_file: str = ""
+
+
+PositionSnapshot = Positions

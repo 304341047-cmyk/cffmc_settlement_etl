@@ -3,6 +3,19 @@ import shutil
 from datetime import datetime
 
 
+def _available_target(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    for idx in range(1, 1000):
+        candidate = path.with_name(f"{path.stem}_{idx}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    return path.with_name(f"{path.stem}_{timestamp}{path.suffix}")
+
+
 def move_to_archive(file_path: Path, archive_root: Path) -> Path:
     """
     成功处理后移动到 archive/yyyy-mm/
@@ -11,7 +24,7 @@ def move_to_archive(file_path: Path, archive_root: Path) -> Path:
     target_dir = archive_root / month_folder
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    target_path = target_dir / file_path.name
+    target_path = _available_target(target_dir / file_path.name)
     shutil.move(str(file_path), str(target_path))
     return target_path
 
@@ -22,6 +35,6 @@ def move_to_error(file_path: Path, error_root: Path) -> Path:
     """
     error_root.mkdir(parents=True, exist_ok=True)
 
-    target_path = error_root / file_path.name
+    target_path = _available_target(error_root / file_path.name)
     shutil.move(str(file_path), str(target_path))
     return target_path

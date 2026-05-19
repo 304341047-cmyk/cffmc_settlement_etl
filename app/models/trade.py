@@ -1,28 +1,33 @@
-from pydantic import BaseModel, Field
-from typing import Optional
 from decimal import Decimal
-from datetime import datetime, date
+
+from pydantic import BaseModel
 
 
-class TradeExecution(BaseModel):
-    trade_date: date = Field(..., description="交易日期")
-    account_id: Optional[str] = Field(None, description="账户编号")
-    instrument_code: str = Field(..., description="合约或证券代码")
-    instrument_name: Optional[str] = Field(None, description="合约或证券名称")
-    asset_type: Optional[str] = Field(None, description="资产类型：futures/stock/option")
-    market: Optional[str] = Field(None, description="市场，如 SHFE / CFFEX / SSE / SZSE")
+class TransactionRecord(BaseModel):
+    date: str | None = None
+    invest_unit: str | None = None
+    exchange: str | None = None
+    trading_code: str | None = None
+    product: str | None = None
+    instrument: str | None = None
+    b_s: str | None = None
+    s_h: str | None = None
+    price: Decimal | None = None
+    lots: Decimal | None = None
+    turnover: Decimal | None = None
+    o_c: str | None = None
+    fee: Decimal | None = None
+    realized_p_l: Decimal | None = None
+    premium_received_paid: Decimal | None = None
+    trans_no: str | None = None
+    account_id: str | None = None
 
-    direction: str = Field(..., description="买卖方向：buy/sell")
-    open_close: Optional[str] = Field(None, description="开平方向：open/close/close_today")
-    volume: int = Field(..., description="成交数量")
-    price: Decimal = Field(..., description="成交价格")
-    turnover: Optional[Decimal] = Field(None, description="成交金额")
-    commission: Optional[Decimal] = Field(None, description="手续费")
+    source_file: str = ""
+    raw_payload: str | None = None
+    sheet_name: str | None = None
+    raw_line_no: int | None = None
+    row_hash: str | None = None
+    trade_time: str | None = None
 
-    trade_time: Optional[datetime] = Field(None, description="成交时间")
-    trade_no: Optional[str] = Field(None, description="成交编号")
 
-    source_file: Optional[str] = Field(None, description="来源文件名")
-    sheet_name: Optional[str] = None
-    raw_line_no: Optional[int] = None
-    row_hash: Optional[str] = None
+TradeExecution = TransactionRecord

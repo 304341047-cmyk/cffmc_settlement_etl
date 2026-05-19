@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any
 
 
 class BaseParser(ABC):
@@ -11,20 +11,21 @@ class BaseParser(ABC):
         pass
 
     @abstractmethod
-    def parse(self, file_path: Path) -> Dict[str, Any]:
+    def parse(self, file_path: Path) -> dict[str, Any]:
         pass
 
-    def parse_result_template(self) -> Dict[str, Any]:
+    def parse_result_template(self) -> dict[str, Any]:
         return {
-            "trades": [],
-            "cash_flows": [],
-            "trade_summaries": [],
-            "close_details": [],
+            "account_summary": [],
+            "deposit_withdrawal": [],
+            "transaction_record": [],
+            "exercise_statement": [],
+            "position_closed": [],
+            "positions_detail": [],
             "positions": [],
-            "position_details": [],
-            "accounts": [],
-            "exercise_details": [],
             "fifo_matches": [],
             "position_lots": [],
-            "validation_issues": [],
+            "fifo_positions": [],
+            "validation_result": [],
+            "warnings": [],
         }

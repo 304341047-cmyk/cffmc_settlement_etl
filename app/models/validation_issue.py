@@ -1,15 +1,18 @@
-from datetime import date
-
 from pydantic import BaseModel
 
 
-class ValidationIssue(BaseModel):
-    trade_date: date | None = None
-    account_id: str | None = None
-    source_file: str | None = None
-    check_name: str
-    severity: str = "error"
-    message: str
-    expected_value: str | None = None
+class ValidationResult(BaseModel):
+    check_name: str = ""
+    status: str = ""
     actual_value: str | None = None
-    is_blocking: bool = True
+    expected_value: str | None = None
+    diff_value: str | None = None
+    tolerance: str | None = None
+    details: str | None = None
+    source_file: str = ""
+    date: str | None = None
+    account_id: str | None = None
+    is_blocking: bool = False
+
+
+ValidationIssue = ValidationResult

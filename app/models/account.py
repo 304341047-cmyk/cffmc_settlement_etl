@@ -1,43 +1,49 @@
 from decimal import Decimal
-from datetime import date
+
 from pydantic import BaseModel
 
 
-class AccountDailySnapshot(BaseModel):
-    """
-    账户日报快照（来自“客户交易结算日报”）
-
-    说明：
-    1. 为了兼容现有逻辑，保留 begin_client_equity / end_client_equity
-    2. 同时补录更贴近原始日报字段的值，便于后续下游分析项目直接使用
-    """
-
-    trade_date: date
+class AccountSummary(BaseModel):
+    creation_date: str | None = None
+    date_from: str | None = None
+    date_to: str | None = None
+    client_id: str | None = None
+    client_name: str | None = None
     account_id: str | None = None
-    broker: str | None = None
+    currency: str | None = None
 
-    # ===== 兼容旧字段 =====
-    begin_client_equity: Decimal | None = None   # 兼容旧逻辑，等于 begin_balance
-    end_client_equity: Decimal | None = None     # 对应当日结存
-
-    # ===== 原始日报字段 =====
-    begin_balance: Decimal | None = None         # 上日结存
-    deposit: Decimal | None = None               # 入金（由“当日存取合计”拆分）
-    withdrawal: Decimal | None = None            # 出金（由“当日存取合计”拆分）
-    premium: Decimal | None = None               # 当日总权利金
-    non_fx_pledge: Decimal | None = None         # 非货币充抵金额
-    fx_pledge: Decimal | None = None             # 货币充抵金额
-    frozen_cash: Decimal | None = None           # 冻结资金
-    margin_call: Decimal | None = None           # 追加保证金
-
-    # ===== 资金/风险相关 =====
-    available_fund: Decimal | None = None
-    margin_occupied: Decimal | None = None
-    realized_pnl: Decimal | None = None
-    unrealized_pnl: Decimal | None = None
+    balance_b_f: Decimal | None = None
+    deposit_withdrawal: Decimal | None = None
+    realized_p_l: Decimal | None = None
+    mtm_p_l: Decimal | None = None
+    exercise_p_l: Decimal | None = None
     commission: Decimal | None = None
-    option_commission: Decimal | None = None
-    exercise_commission: Decimal | None = None
-    risk_degree: Decimal | None = None
+    exercise_fee: Decimal | None = None
+    delivery_fee: Decimal | None = None
+    new_fx_pledge: Decimal | None = None
+    fx_redemption: Decimal | None = None
+    chg_in_pledge_amt: Decimal | None = None
+    premium_received: Decimal | None = None
+    premium_paid: Decimal | None = None
+    delivery_p_l: Decimal | None = None
 
-    source_file: str | None = None
+    initial_margin: Decimal | None = None
+    balance_c_f: Decimal | None = None
+    pledge_amount: Decimal | None = None
+    client_equity: Decimal | None = None
+    fx_pledge_occ: Decimal | None = None
+    margin_occupied: Decimal | None = None
+    delivery_margin: Decimal | None = None
+    market_value_long: Decimal | None = None
+    market_value_short: Decimal | None = None
+    market_value_equity: Decimal | None = None
+    fund_avail: Decimal | None = None
+    risk_degree: Decimal | None = None
+    margin_call: Decimal | None = None
+    chg_in_fx_pledge: Decimal | None = None
+
+    source_file: str = ""
+    raw_payload: str | None = None
+
+
+AccountDailySnapshot = AccountSummary

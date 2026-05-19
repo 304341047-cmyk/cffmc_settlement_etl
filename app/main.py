@@ -1,17 +1,27 @@
-from app.config import ensure_directories, INBOX_DIR, ARCHIVE_DIR, ERROR_DIR
-from app.utils.file_move import move_to_archive, move_to_error
-from app.utils.logger import setup_logger
-from app.parsers.registry import ParserRegistry
+import re
 
+from app.config import ARCHIVE_DIR, ERROR_DIR, INBOX_DIR, ensure_directories
 from app.db.base import engine
 from app.db.models import Base
 from app.db_writer import (
+    BlockingValidationError,
     create_chinese_query_views,
-    save_to_db,
-    save_source_file_record,
     is_file_already_processed,
+    save_source_file_record,
+    save_to_db,
 )
+from app.parsers.registry import ParserRegistry
 from app.utils.file_hash import calculate_file_md5
+from app.utils.file_move import move_to_archive, move_to_error
+from app.utils.logger import setup_logger
+
+
+def file_sort_key(file_path):
+    match = re.search(r"(\d+).*?(\d{4})-(\d{2})-(\d{2})", file_path.name)
+    if not match:
+        return "", "99999999", file_path.name
+    account, year, month, day = match.groups()
+    return account, f"{year}{month}{day}", file_path.name
 
 
 def main():
@@ -23,43 +33,38 @@ def main():
 
     logger = setup_logger()
     logger.info("程序启动成功")
-    logger.info(f"收件目录: {INBOX_DIR}")
+    logger.info("收件目录: %s", INBOX_DIR)
 
-    # 先冻结文件列表，避免循环过程中移动文件带来干扰
-    files = [
-        f for f in list(INBOX_DIR.glob("*"))
-        if f.is_file() and not f.name.startswith("~$")
-    ]
-
-    logger.info(f"发现文件数量: {len(files)}")
+    files = sorted(
+        [
+            f for f in list(INBOX_DIR.glob("*"))
+            if f.is_file() and not f.name.startswith("~$")
+        ],
+        key=file_sort_key,
+    )
+    logger.info("发现文件数量: %s", len(files))
 
     registry = ParserRegistry()
 
     for file in files:
-        logger.info(f"待处理文件: {file.name}")
-
+        logger.info("待处理文件: %s", file.name)
         parser = None
         file_hash = None
 
         try:
-            # 1. 先算 hash
             file_hash = calculate_file_md5(file)
-
-            # 2. 文件级去重：已成功处理过则直接跳过并归档
             if is_file_already_processed(file_hash):
-                logger.info(f"跳过已处理文件: {file.name}")
+                logger.info("跳过已成功处理文件: %s", file.name)
                 try:
                     archived_path = move_to_archive(file, ARCHIVE_DIR)
-                    logger.info(f"已处理文件已归档: {archived_path}")
+                    logger.info("已处理文件已归档: %s", archived_path)
                 except PermissionError as e:
-                    logger.warning(f"已处理文件归档失败，可能正被占用: {file.name}, 错误: {e}")
+                    logger.warning("已处理文件归档失败，可能正被占用: %s, 错误: %s", file.name, e)
                 continue
 
-            # 3. 查找解析器
             parser = registry.get_parser(file)
             if not parser:
-                logger.warning(f"未找到可用解析器: {file.name}")
-
+                logger.warning("未找到可用解析器: %s", file.name)
                 save_source_file_record(
                     file_name=file.name,
                     file_path=str(file),
@@ -68,45 +73,28 @@ def main():
                     status="failed",
                     error_message="未找到可用解析器",
                 )
-
                 try:
                     error_path = move_to_error(file, ERROR_DIR)
-                    logger.info(f"文件已移入错误目录: {error_path}")
+                    logger.info("文件已移入错误目录: %s", error_path)
                 except PermissionError as e:
-                    logger.warning(f"未识别文件移动到错误目录失败，可能正被占用: {file.name}, 错误: {e}")
+                    logger.warning("未识别文件移动到错误目录失败，可能正被占用: %s, 错误: %s", file.name, e)
                 continue
 
-            logger.info(f"使用解析器: {parser.name}")
-
-            # 4. 解析
+            logger.info("使用解析器: %s", parser.name)
             result = parser.parse(file)
+            logger.info(
+                "解析完成: %s | account=%s deposit=%s transaction=%s closed=%s pos_detail=%s positions=%s exercise=%s",
+                file.name,
+                len(result.get("account_summary", [])),
+                len(result.get("deposit_withdrawal", [])),
+                len(result.get("transaction_record", [])),
+                len(result.get("position_closed", [])),
+                len(result.get("positions_detail", [])),
+                len(result.get("positions", [])),
+                len(result.get("exercise_statement", [])),
+            )
 
-            logger.info(f"解析完成: {file.name}")
-            logger.info(f"成交记录数: {len(result.get('trades', []))}")
-            logger.info(f"持仓明细数: {len(result.get('position_details', []))}")
-            logger.info(f"持仓快照数: {len(result.get('positions', []))}")
-            logger.info(f"账户快照数: {len(result.get('accounts', []))}")
-            logger.info(f"行权明细数: {len(result.get('exercise_details', []))}")
-
-            validation = result.get("validation", {})
-            commission_check = validation.get("commission_check", {})
-            if commission_check:
-                c = commission_check
-                logger.info(
-                    f"手续费校验 -> "
-                    f"期货: {c['futures']}, "
-                    f"期权: {c['option']}, "
-                    f"行权: {c['exercise']}, "
-                    f"合计: {c['total_calc']}, "
-                    f"日报: {c['account']}, "
-                    f"差额: {c['diff']}, "
-                    f"是否匹配: {c['is_match']}"
-                )
-
-            # 5. 入库
             save_result = save_to_db(result)
-
-            # 6. 记录来源文件
             save_source_file_record(
                 file_name=file.name,
                 file_path=str(file),
@@ -115,25 +103,17 @@ def main():
                 status="success",
             )
 
-            logger.info(f"数据已写入数据库: {file.name}")
-            logger.info(
-                f"本次新增 -> "
-                f"成交: {save_result.get('inserted_trades', 0)}, "
-                f"持仓明细: {save_result.get('inserted_position_details', 0)}, "
-                f"持仓快照: {save_result.get('inserted_positions', 0)}, "
-                f"账户: {save_result.get('inserted_accounts', 0)}"
-            )
+            logger.info("数据已写入数据库: %s", file.name)
+            logger.info("本次新增: %s", save_result)
 
-            # 7. 成功后归档
             try:
                 archived_path = move_to_archive(file, ARCHIVE_DIR)
-                logger.info(f"文件已归档: {archived_path}")
+                logger.info("文件已归档: %s", archived_path)
             except PermissionError as e:
-                logger.warning(f"文件处理成功，但归档失败，可能正被占用: {file.name}, 错误: {e}")
+                logger.warning("文件处理成功，但归档失败，可能正被占用: %s, 错误: %s", file.name, e)
 
-        except Exception as e:
-            logger.exception(f"解析失败: {file.name}, 错误: {e}")
-
+        except BlockingValidationError as e:
+            logger.error("关键校验失败，业务数据未入库: %s, 错误: %s", file.name, e)
             save_source_file_record(
                 file_name=file.name,
                 file_path=str(file),
@@ -142,12 +122,27 @@ def main():
                 status="failed",
                 error_message=str(e),
             )
-
             try:
                 error_path = move_to_error(file, ERROR_DIR)
-                logger.info(f"文件已移入错误目录: {error_path}")
+                logger.info("文件已移入错误目录: %s", error_path)
             except PermissionError as pe:
-                logger.warning(f"文件处理失败，且移动到错误目录时被占用: {file.name}, 错误: {pe}")
+                logger.warning("文件处理失败，且移动到错误目录时被占用: %s, 错误: %s", file.name, pe)
+
+        except Exception as e:
+            logger.exception("解析失败: %s, 错误: %s", file.name, e)
+            save_source_file_record(
+                file_name=file.name,
+                file_path=str(file),
+                file_hash=file_hash or "",
+                parser_name=parser.name if parser else None,
+                status="failed",
+                error_message=str(e),
+            )
+            try:
+                error_path = move_to_error(file, ERROR_DIR)
+                logger.info("文件已移入错误目录: %s", error_path)
+            except PermissionError as pe:
+                logger.warning("文件处理失败，且移动到错误目录时被占用: %s, 错误: %s", file.name, pe)
 
 
 if __name__ == "__main__":
